@@ -143,6 +143,13 @@ impl MpvPlayer {
         }
     }
 
+    pub fn seek_abs(&self, target_sec: f64) {
+        if self.sock_path.exists() {
+            let t = target_sec.max(0.0);
+            let _ = self.send_cmd(json!(["seek", t, "absolute"]));
+        }
+    }
+
     pub fn seek_percent(&self, pct: f64) {
         if self.sock_path.exists() {
             let p = pct.clamp(0.0, 100.0);

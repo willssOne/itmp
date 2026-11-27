@@ -2,6 +2,7 @@ mod artist;
 mod cache;
 mod cover;
 mod downloader;
+mod genius;
 mod lyrics;
 mod player;
 mod spotify;
@@ -17,6 +18,7 @@ use downloader::{
     download_and_cache_track, expand_local_path, fetch_spotify_metadata, import_local_music,
     parse_spotify_export_file, search_youtube, SearchResult, SpotifyTrackSpec,
 };
+use genius::{fetch_song_annotations, match_lyric_annotation, GeniusSongAnnotations};
 use lyrics::{load_lrc, AudioEnvelope, LrcLine};
 use player::{MpvPlayer, PlaybackState};
 use spotify::{
@@ -39,16 +41,16 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::{
-    collections::VecDeque,
-    env, io,
+    collections::{HashMap, VecDeque},
+    env, fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,14 +127,15 @@ enum WorkerMsg {
     SpotifyCollectionsDone(Result<Vec<SpotifyCollection>, String>),
     SpotifyTracksDone(Result<(SpotifyCollection, Vec<SpotifyTrackSpec>), String>),
     SpotifyPublicUrlAdded(Result<(SavedSpotifyLink, Vec<SpotifyTrackSpec>), String>),
-    ArtistLoaded(Result<ArtistProfile, String>),
-    ArtistAvatarReady(String, PathBuf),
+    ArtistLoaded(Result<(ArtistProfile, Option<PathBuf>), String>),
+    GeniusLoaded(String, String, Result<GeniusSongAnnotations, String>), // (song_key, lyric_line, res)
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ButtonAction {
     Home,
     SearchBtn,
+    ToggleDownloads,
     Settings,
     Prev,
     PlayPause,
@@ -155,17 +158,38 @@ enum ButtonAction {
     ToggleLikeArtist,
     ArtistImportAll,
     OpenCurrentArtist,
+    ClosePopup,
+}
+
+#[derive(Debug, Clone)]
+struct GeniusPopup {
+    song_title: String,
+    lyric_line: String,
+    fragment: String,
+    explanation: String,
+    url: String,
+    loading: bool,
 }
 
 #[derive(Default)]
 struct HitAreas {
     search_box: Rect,
+    dl_btn: Rect,
     sidebar: Rect,
     track_list: Rect,
     settings_list: Rect,
+    lyrics_area: Rect,
     progress_bar: Rect,
     controls_bar: Rect,
     buttons: Vec<(Rect, ButtonAction)>,
+    lyrics_rows: Vec<(u16, usize, f64)>,       // (screen_y, lrc_idx, time_sec)
+    lyric_help_btns: Vec<(Rect, usize)>,       // ([?] hitbox, lrc_idx)
+    artist_links: Vec<(Rect, String)>,         // (clickable artist rect, artist_name)
+    album_links: Vec<(Rect, String, String)>,  // (clickable album rect, artist, album)
+    dl_dropdown: Rect,
+    dl_play_rows: Vec<(Rect, String)>,         // (row rect, filename)
+    dl_del_btns: Vec<(Rect, String)>,          // ([x] delete rect, filename)
+    popup_rect: Rect,
 }
 
 struct App {
@@ -222,9 +246,16 @@ struct App {
     artist_track_state: ListState,
 
     hits: HitAreas,
+    mouse_pos: (u16, u16),
     last_click: Option<(usize, Instant)>,
 
+    // Top Downloads dropdown & Genius lyric explanation popup
+    show_downloads_menu: bool,
+    genius_cache: HashMap<String, GeniusSongAnnotations>,
+    genius_popup: Option<GeniusPopup>,
+
     status: String,
+    status_at: Instant,
     busy: bool,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
@@ -293,8 +324,13 @@ impl App {
             artist_avatar_size: (0, 0),
             artist_track_state: ListState::default(),
             hits: HitAreas::default(),
+            mouse_pos: (0, 0),
             last_click: None,
-            status: "Ready".into(),
+            show_downloads_menu: false,
+            genius_cache: HashMap::new(),
+            genius_popup: None,
+            status: String::new(),
+            status_at: now - Duration::from_secs(10),
             busy: false,
             tx,
             rx,
@@ -612,19 +648,12 @@ impl App {
 
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let res = fetch_artist_profile(&lookup, saved_id.as_deref());
-            if let Ok(ref prof) = res {
-                // Spawn avatar fetch in parallel
-                if let Some(img_url) = prof.image_url.clone() {
-                    let tx_av = tx.clone();
-                    let aname = prof.name.clone();
-                    thread::spawn(move || {
-                        if let Some(p) = fetch_remote_image_to_temp(&img_url, &format!("artist-{aname}")) {
-                            let _ = tx_av.send(WorkerMsg::ArtistAvatarReady(aname, p));
-                        }
-                    });
-                }
-                // Spawn background mini thumbnails for artist top tracks
+            let res = fetch_artist_profile(&lookup, saved_id.as_deref()).map(|prof| {
+                // Download artist avatar atomically BEFORE sending ArtistLoaded so it's 100% race-free!
+                let avatar_path = prof
+                    .image_url
+                    .as_deref()
+                    .and_then(|u| fetch_remote_image_to_temp(u, &format!("artist-{}", prof.name)));
                 let thumb_jobs: Vec<(String, String)> = prof
                     .top_tracks
                     .iter()
@@ -634,9 +663,130 @@ impl App {
                     })
                     .collect();
                 spawn_thumb_fetcher(thumb_jobs, tx.clone());
-            }
+                (prof, avatar_path)
+            });
             let _ = tx.send(WorkerMsg::ArtistLoaded(res));
         });
+    }
+
+    fn set_notice(&mut self, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_at = Instant::now();
+    }
+
+    fn recent_downloaded_tracks(&self, limit: usize) -> Vec<(String, String, String, u64)> {
+        let mut items: Vec<(u64, String, String, String, u64)> = self
+            .lib
+            .entries
+            .values()
+            .map(|e| {
+                let mtime = fs::metadata(self.dir.join(&e.filename))
+                    .and_then(|m| m.modified())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(|_| io::Error::other("ts")))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(e.last_used);
+                (
+                    mtime,
+                    e.filename.clone(),
+                    e.title.clone(),
+                    clean_artist_name(&e.artist),
+                    e.size_bytes,
+                )
+            })
+            .collect();
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items
+            .into_iter()
+            .take(limit)
+            .map(|(_, f, t, a, sz)| (f, t, a, sz))
+            .collect()
+    }
+
+    fn delete_track_by_filename(&mut self, fname: &str) {
+        let title = self
+            .lib
+            .entries
+            .get(fname)
+            .map(|e| e.title.clone())
+            .unwrap_or_else(|| fname.to_string());
+        if self.player.current_file.as_deref() == Some(fname) {
+            self.player.stop();
+            self.was_playing_file = false;
+        }
+        remove_track_files(&self.dir, fname);
+        self.lib.entries.remove(fname);
+        for pl in &mut self.lib.playlists {
+            pl.tracks.retain(|x| x != fname);
+        }
+        self.queue.retain(|x| x != fname);
+        save_library(&self.dir, &self.lib);
+        self.rebuild_track_list();
+        self.set_notice(format!("Deleted '{title}'"));
+    }
+
+    fn open_genius_for_lyric(&mut self, lrc_idx: usize) {
+        let Some(line) = self.lrc_lines.get(lrc_idx).cloned() else {
+            return;
+        };
+        let Some(cur) = self.current_track_entry().cloned() else {
+            return;
+        };
+        let song_key = format!("{}|{}", cur.artist, cur.title);
+        if let Some(cached) = self.genius_cache.get(&song_key).cloned() {
+            self.show_genius_match(&cached, &line.text);
+            return;
+        }
+        self.genius_popup = Some(GeniusPopup {
+            song_title: format!("{} - {}", cur.title, clean_artist_name(&cur.artist)),
+            lyric_line: line.text.clone(),
+            fragment: String::new(),
+            explanation: "Loading Genius explanation...".into(),
+            url: String::new(),
+            loading: true,
+        });
+        let title = cur.title.clone();
+        let artist = cur.artist.clone();
+        let lyric_text = line.text.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let res = fetch_song_annotations(&title, &artist);
+            let _ = tx.send(WorkerMsg::GeniusLoaded(song_key, lyric_text, res));
+        });
+    }
+
+    fn show_genius_match(&mut self, song: &GeniusSongAnnotations, lyric_line: &str) {
+        if let Some(ann) = match_lyric_annotation(song, lyric_line) {
+            self.genius_popup = Some(GeniusPopup {
+                song_title: song.song_title.clone(),
+                lyric_line: lyric_line.to_string(),
+                fragment: ann.fragment.clone(),
+                explanation: ann.explanation.clone(),
+                url: song.song_url.clone(),
+                loading: false,
+            });
+        } else {
+            self.genius_popup = Some(GeniusPopup {
+                song_title: song.song_title.clone(),
+                lyric_line: lyric_line.to_string(),
+                fragment: String::new(),
+                explanation: format!(
+                    "No Genius annotation found for this specific line ({} annotated bars on this song).",
+                    song.items.len()
+                ),
+                url: song.song_url.clone(),
+                loading: false,
+            });
+        }
+    }
+
+    fn open_album_search(&mut self, artist: &str, album: &str) {
+        let q = if artist.trim().is_empty() {
+            format!("{album} full album")
+        } else {
+            format!("{} {}", artist.trim(), album.trim())
+        };
+        self.input_buf = q;
+        self.start_youtube_search();
     }
 
     fn open_selected_or_playing_artist(&mut self) {
@@ -988,29 +1138,33 @@ impl App {
                     self.busy = false;
                     self.status = format!("Spotify link error: {e}");
                 }
-                WorkerMsg::ArtistLoaded(Ok(prof)) => {
+                WorkerMsg::ArtistLoaded(Ok((prof, avatar_path))) => {
                     self.busy = false;
                     self.artist_loading_name = None;
                     let n = prof.top_tracks.len();
                     let name = prof.name.clone();
                     self.artist_track_state.select(if n > 0 { Some(0) } else { None });
                     self.artist_profile = Some(prof);
-                    self.status = format!("Artist: {name} ({n} top tracks)");
+                    self.artist_avatar_path = avatar_path;
+                    self.artist_avatar_art = None;
+                    self.set_notice(format!("Artist: {name} ({n} top tracks)"));
                 }
                 WorkerMsg::ArtistLoaded(Err(e)) => {
                     self.busy = false;
                     self.artist_loading_name = None;
-                    self.status = format!("Artist lookup failed: {e}");
+                    self.set_notice(format!("Artist lookup failed: {e}"));
                 }
-                WorkerMsg::ArtistAvatarReady(name, path) => {
-                    if self
-                        .artist_profile
-                        .as_ref()
-                        .map(|p| p.name == name)
-                        .unwrap_or(false)
-                    {
-                        self.artist_avatar_path = Some(path);
-                        self.artist_avatar_art = None;
+                WorkerMsg::GeniusLoaded(song_key, lyric_line, Ok(song)) => {
+                    self.genius_cache.insert(song_key, song.clone());
+                    if self.genius_popup.as_ref().map(|p| p.loading).unwrap_or(false) {
+                        self.show_genius_match(&song, &lyric_line);
+                    }
+                }
+                WorkerMsg::GeniusLoaded(_, lyric_line, Err(e)) => {
+                    if let Some(p) = self.genius_popup.as_mut() {
+                        p.loading = false;
+                        p.lyric_line = lyric_line;
+                        p.explanation = e;
                     }
                 }
             }
@@ -1667,6 +1821,16 @@ impl App {
                 self.start_spotify_load_collections();
             }
             ButtonAction::SpotifyLogout => self.logout_spotify(),
+            ButtonAction::ToggleDownloads => {
+                self.show_downloads_menu = !self.show_downloads_menu;
+                if self.show_downloads_menu {
+                    self.genius_popup = None;
+                }
+            }
+            ButtonAction::ClosePopup => {
+                self.genius_popup = None;
+                self.show_downloads_menu = false;
+            }
             ButtonAction::ToggleLikeArtist => self.toggle_like_current_artist(),
             ButtonAction::ArtistImportAll => self.start_artist_import_all(),
             ButtonAction::OpenCurrentArtist => self.open_selected_or_playing_artist(),
@@ -1674,7 +1838,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) {
+        self.mouse_pos = (col, row);
         match kind {
+            MouseEventKind::Moved => {}
             MouseEventKind::ScrollUp => {
                 if rect_contains(self.hits.controls_bar, col, row) {
                     let v = self.player.volume + 5;
@@ -1692,10 +1858,93 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // 1. Floating Genius popup captures clicks first
+                if self.genius_popup.is_some() {
+                    let buttons = self.hits.buttons.clone();
+                    for (r, act) in buttons {
+                        if matches!(act, ButtonAction::ClosePopup) && rect_contains(r, col, row) {
+                            self.genius_popup = None;
+                            return;
+                        }
+                    }
+                    if !rect_contains(self.hits.popup_rect, col, row) {
+                        self.genius_popup = None;
+                    }
+                    return;
+                }
+
+                // 2. Floating Downloads dropdown captures clicks before underlying UI
+                if self.show_downloads_menu {
+                    let del_btns = self.hits.dl_del_btns.clone();
+                    for (r, fname) in del_btns {
+                        if rect_contains(r, col, row) {
+                            self.delete_track_by_filename(&fname);
+                            return;
+                        }
+                    }
+                    let play_rows = self.hits.dl_play_rows.clone();
+                    for (r, fname) in play_rows {
+                        if rect_contains(r, col, row) {
+                            self.play_filename(&fname, true);
+                            self.show_downloads_menu = false;
+                            return;
+                        }
+                    }
+                    if rect_contains(self.hits.dl_btn, col, row) {
+                        self.show_downloads_menu = false;
+                        return;
+                    }
+                    if !rect_contains(self.hits.dl_dropdown, col, row) {
+                        self.show_downloads_menu = false;
+                        // fall through so clicking outside also interacts cleanly
+                    } else {
+                        return;
+                    }
+                }
+
+                // 3. Regular buttons (Top bar, Controls, Artist/Settings actions)
                 let buttons = self.hits.buttons.clone();
                 for (r, act) in buttons {
                     if rect_contains(r, col, row) {
                         self.trigger_button(act);
+                        return;
+                    }
+                }
+
+                // 4. Lyric [?] Genius explanation buttons
+                let lrc_help = self.hits.lyric_help_btns.clone();
+                for (r, lrc_idx) in lrc_help {
+                    if rect_contains(r, col, row) {
+                        self.open_genius_for_lyric(lrc_idx);
+                        return;
+                    }
+                }
+
+                // 5. Click anywhere on a lyric line -> seek straight to that timestamp!
+                if rect_contains(self.hits.lyrics_area, col, row) {
+                    let lrows = self.hits.lyrics_rows.clone();
+                    if let Some(&(_, _, target_sec)) = lrows.iter().find(|&&(y, _, _)| y == row) {
+                        if self.pb.active {
+                            self.player.seek_abs(target_sec);
+                            self.smooth_pos = target_sec;
+                            self.set_notice(format!("Seeked to {}", fmt_time(target_sec)));
+                        }
+                        return;
+                    }
+                }
+
+                // 6. Click underlined Artist or Album links anywhere in Song Browser / Search / Artist!
+                let artist_links = self.hits.artist_links.clone();
+                for (r, artist_name) in artist_links {
+                    if rect_contains(r, col, row) {
+                        self.open_artist_profile(&artist_name, None);
+                        return;
+                    }
+                }
+                let album_links = self.hits.album_links.clone();
+                for (r, artist_name, album_name) in album_links {
+                    if rect_contains(r, col, row) {
+                        self.open_album_search(&artist_name, &album_name);
                         return;
                     }
                 }
@@ -2072,13 +2321,16 @@ fn wrap_plain_text(text: &str, max_w: usize) -> Vec<String> {
     rows
 }
 
-/// Clean, vertically-centered truecolor word-by-word synced lyrics:
-/// - ONLY the active line is bright (lines above & below stay strictly dimmed)
-/// - Blank breathing space + live progress hairline frame the active bar
-/// - Main vocal sweeps in mint-green -> bright white; parallel adlibs sweep in gold at the same time
-fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'static>> {
-    let h = area_h.saturating_sub(2) as usize;
-    let inner_w = area_w.saturating_sub(4).max(16) as usize;
+/// Clean, vertically-centered truecolor word-by-word synced lyrics with hover highlight,
+/// click-to-seek timestamp mapping, and clickable `[?]` Genius explanation triggers.
+fn render_word_synced_lyrics(
+    app: &App,
+    lrc_area: Rect,
+) -> (Vec<Line<'static>>, Vec<(u16, usize, f64)>, Vec<(Rect, usize)>) {
+    let h = lrc_area.height.saturating_sub(2) as usize;
+    let inner_w = lrc_area.width.saturating_sub(8).max(16) as usize; // leave 4 cols on right for `[?]`
+    let (mx, my) = app.mouse_pos;
+    let mouse_in_lyrics = rect_contains(lrc_area, mx, my);
 
     if app.lrc_lines.is_empty() {
         let pad = h / 2;
@@ -2091,7 +2343,7 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
             },
             Style::default().fg(Color::Rgb(84, 84, 92)),
         )));
-        return lines;
+        return (lines, Vec::new(), Vec::new());
     }
 
     let offset_sec = app
@@ -2102,8 +2354,8 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
 
     let active_opt = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos);
     let Some(active_idx) = active_opt else {
-        // Intro before first lyric line: show dim upcoming preview centered
         let mut out = Vec::new();
+        let mut row_map = Vec::new();
         let pad = h.saturating_sub(4) / 2;
         for _ in 0..pad {
             out.push(Line::from(""));
@@ -2113,20 +2365,22 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
             Style::default().fg(Color::Rgb(95, 95, 102)),
         )));
         out.push(Line::from(""));
-        for l in app.lrc_lines.iter().take(3) {
+        for (li, l) in app.lrc_lines.iter().take(3).enumerate() {
             for r in wrap_plain_text(&l.text, inner_w) {
+                let sy = lrc_area.y + 1 + out.len() as u16;
+                row_map.push((sy, li, l.time_sec));
                 out.push(Line::from(Span::styled(
                     r,
                     Style::default().fg(Color::Rgb(68, 68, 76)),
                 )));
             }
         }
-        return out;
+        return (out, row_map, Vec::new());
     };
 
     // Build active bar lines (word-by-word + simultaneous adlibs)
     let active_entry = &app.lrc_lines[active_idx];
-    let mut active_rows: Vec<Line<'static>> = Vec::new();
+    let mut active_rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current_row: Vec<Span<'static>> = Vec::new();
     let mut row_len = 0usize;
 
@@ -2141,7 +2395,7 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         let w_len = w_chars.len();
         let need_space = if current_row.is_empty() { 0 } else { 1 };
         if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
-            active_rows.push(Line::from(std::mem::take(&mut current_row)));
+            active_rows.push(std::mem::take(&mut current_row));
             row_len = 0;
         }
         if !current_row.is_empty() {
@@ -2152,19 +2406,19 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         let dur = (w.end - w.start).max(0.07);
         let (active_fg, unlit_active_fg, sung_style, upcoming_fg) = if w.is_adlib {
             (
-                Color::Rgb(242, 202, 92),  // warm gold sweeping adlib
-                Color::Rgb(138, 122, 82),  // unswept half of active adlib
+                Color::Rgb(242, 202, 92),
+                Color::Rgb(138, 122, 82),
                 Style::default().fg(Color::Rgb(192, 166, 98)),
-                Color::Rgb(84, 84, 92),    // dim upcoming adlib
+                Color::Rgb(84, 84, 92),
             )
         } else {
             (
-                Color::Rgb(118, 238, 148), // crisp mint-green sweeping main word
-                Color::Rgb(132, 136, 144), // unswept half stays dim (never jumps to white!)
+                Color::Rgb(118, 238, 148),
+                Color::Rgb(132, 136, 144),
                 Style::default()
                     .fg(Color::Rgb(244, 244, 246))
                     .add_modifier(Modifier::BOLD),
-                Color::Rgb(96, 98, 106),   // clearly muted upcoming main word
+                Color::Rgb(96, 98, 106),
             )
         };
 
@@ -2188,11 +2442,10 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         row_len += w_len;
 
         if wi + 1 == active_entry.words.len() && !current_row.is_empty() {
-            active_rows.push(Line::from(std::mem::take(&mut current_row)));
+            active_rows.push(std::mem::take(&mut current_row));
         }
     }
 
-    // Subtle live progress hairline directly under the active lyric bar
     let bar_w = inner_w.min(26).max(8);
     let bar_frac = if bar_end > bar_start {
         ((pos - bar_start) / (bar_end - bar_start)).clamp(0.0, 1.0)
@@ -2211,39 +2464,36 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         ),
     ]);
 
-    // Total active block height: 1 blank above + active_rows + progress hairline + 1 blank below
     let active_block_h = 1 + active_rows.len() + 1 + 1;
     let avail_above = h.saturating_sub(active_block_h) / 2;
     let avail_below = h.saturating_sub(active_block_h + avail_above);
 
-    // Collect strictly-dimmed lines ABOVE active_idx (walking backwards)
-    let mut above_lines: Vec<Line<'static>> = Vec::new();
+    // Collect plain rows above active_idx: (text, lrc_idx, time_sec, base_color)
+    let mut above_raw: Vec<(String, usize, f64, Color)> = Vec::new();
     for back in 1..=active_idx {
-        if above_lines.len() >= avail_above {
+        if above_raw.len() >= avail_above {
             break;
         }
         let idx = active_idx - back;
-        // All non-active lines stay strictly dimmed (subtle distance fade, never bright!)
         let color = if back == 1 {
             Color::Rgb(82, 82, 90)
         } else {
             Color::Rgb(54, 54, 60)
         };
-        let wrapped = wrap_plain_text(&app.lrc_lines[idx].text, inner_w);
-        for row in wrapped.into_iter().rev() {
-            if above_lines.len() >= avail_above {
+        let t = app.lrc_lines[idx].time_sec;
+        for row in wrap_plain_text(&app.lrc_lines[idx].text, inner_w).into_iter().rev() {
+            if above_raw.len() >= avail_above {
                 break;
             }
-            above_lines.push(Line::from(Span::styled(row, Style::default().fg(color))));
+            above_raw.push((row, idx, t, color));
         }
     }
-    above_lines.reverse();
+    above_raw.reverse();
 
-    // Collect strictly-dimmed lines BELOW active_idx
-    let mut below_lines: Vec<Line<'static>> = Vec::new();
+    let mut below_raw: Vec<(String, usize, f64, Color)> = Vec::new();
     for fwd in 1.. {
         let idx = active_idx + fwd;
-        if idx >= app.lrc_lines.len() || below_lines.len() >= avail_below {
+        if idx >= app.lrc_lines.len() || below_raw.len() >= avail_below {
             break;
         }
         let color = if fwd == 1 {
@@ -2251,26 +2501,107 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         } else {
             Color::Rgb(54, 54, 60)
         };
+        let t = app.lrc_lines[idx].time_sec;
         for row in wrap_plain_text(&app.lrc_lines[idx].text, inner_w) {
-            if below_lines.len() >= avail_below {
+            if below_raw.len() >= avail_below {
                 break;
             }
-            below_lines.push(Line::from(Span::styled(row, Style::default().fg(color))));
+            below_raw.push((row, idx, t, color));
         }
     }
 
-    let mut out = Vec::with_capacity(h);
-    // Top padding so active bar stays vertically centered even on line 0/1
-    for _ in 0..avail_above.saturating_sub(above_lines.len()) {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(h);
+    let mut row_map: Vec<(u16, usize, f64)> = Vec::new();
+    let mut help_btns: Vec<(Rect, usize)> = Vec::new();
+    let box_inner_w = lrc_area.width.saturating_sub(2) as usize;
+
+    let push_centered_dim = |out: &mut Vec<Line<'static>>,
+                             row_map: &mut Vec<(u16, usize, f64)>,
+                             help_btns: &mut Vec<(Rect, usize)>,
+                             text: String,
+                             idx: usize,
+                             t: f64,
+                             base_color: Color| {
+        let sy = lrc_area.y + 1 + out.len() as u16;
+        let hovered = mouse_in_lyrics && my == sy;
+        row_map.push((sy, idx, t));
+        if hovered {
+            let line_str = format!("{text} [?]");
+            let total_chars = line_str.chars().count();
+            let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
+            let q_x = lrc_area.x + 1 + (left_pad + text.chars().count() + 1) as u16;
+            let q_rect = Rect::new(q_x, sy, 3, 1);
+            let q_hov = rect_contains(q_rect, mx, my);
+            help_btns.push((q_rect, idx));
+            out.push(Line::from(vec![
+                Span::styled(
+                    text,
+                    Style::default()
+                        .fg(Color::Rgb(178, 186, 200))
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    "[?]",
+                    if q_hov {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                ),
+            ]));
+        } else {
+            out.push(Line::from(Span::styled(text, Style::default().fg(base_color))));
+        }
+    };
+
+    for _ in 0..avail_above.saturating_sub(above_raw.len()) {
         out.push(Line::from(""));
     }
-    out.extend(above_lines);
+    for (text, idx, t, color) in above_raw {
+        push_centered_dim(&mut out, &mut row_map, &mut help_btns, text, idx, t, color);
+    }
+
     out.push(Line::from(""));
-    out.extend(active_rows);
+    let active_t = app.lrc_lines[active_idx].time_sec;
+    for (ri, mut spans) in active_rows.into_iter().enumerate() {
+        let sy = lrc_area.y + 1 + out.len() as u16;
+        row_map.push((sy, active_idx, active_t));
+        if ri == 0 {
+            // Show subtle clickable `[?]` right beside the active lyric line too
+            let text_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let total_chars = text_chars + 4;
+            let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
+            let q_x = lrc_area.x + 1 + (left_pad + text_chars + 1) as u16;
+            let q_rect = Rect::new(q_x, sy, 3, 1);
+            let q_hov = mouse_in_lyrics && rect_contains(q_rect, mx, my);
+            help_btns.push((q_rect, active_idx));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "[?]",
+                if q_hov {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(120, 122, 130))
+                },
+            ));
+        }
+        out.push(Line::from(spans));
+    }
     out.push(bar_line);
     out.push(Line::from(""));
-    out.extend(below_lines);
-    out
+
+    for (text, idx, t, color) in below_raw {
+        push_centered_dim(&mut out, &mut row_map, &mut help_btns, text, idx, t, color);
+    }
+
+    (out, row_map, help_btns)
 }
 
 fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
@@ -2288,16 +2619,24 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
 
         terminal.draw(|f| {
             app.hits.buttons.clear();
+            app.hits.lyrics_rows.clear();
+            app.hits.lyric_help_btns.clear();
+            app.hits.artist_links.clear();
+            app.hits.album_links.clear();
+            app.hits.dl_play_rows.clear();
+            app.hits.dl_del_btns.clear();
             app.hits.settings_list = Rect::default();
+            app.hits.lyrics_area = Rect::default();
+            app.hits.dl_dropdown = Rect::default();
+            app.hits.popup_rect = Rect::default();
 
             let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3), // 0: Spotify-style Top Bar ([ itmp ] | Search | [ Search ] | [ Settings ])
+                    Constraint::Length(3), // 0: Top Bar ([ itmp ] | Search | [ Search ] | [ v DL ] | [ Settings ])
                     Constraint::Min(10),   // 1: Body: Library+Cover | Main View | Live Lyrics
                     Constraint::Length(3), // 2: Now Playing progress + time left
                     Constraint::Length(3), // 3: Controls bar
-                    Constraint::Length(3), // 4: Status / Input prompt
                 ])
                 .split(f.area());
 
@@ -2306,9 +2645,10 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Length(10), // [ itmp ]
-                    Constraint::Min(20),    // Search input
-                    Constraint::Length(12), // [ Search ]
-                    Constraint::Length(14), // [ Settings ]
+                    Constraint::Min(18),    // Search input
+                    Constraint::Length(11), // [ Search ]
+                    Constraint::Length(10), // [ v DL ]
+                    Constraint::Length(13), // [ Settings ]
                 ])
                 .split(outer[0]);
 
@@ -2388,6 +2728,35 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
             app.hits.buttons.push((top_cols[2], ButtonAction::SearchBtn));
             f.render_widget(search_btn, top_cols[2]);
 
+            // Top [ v DL ] Downloads dropdown button right next to Search
+            app.hits.dl_btn = top_cols[3];
+            let dl_label = if app.busy { " * DL " } else { " v DL " };
+            let dl_btn = Paragraph::new(dl_label)
+                .alignment(Alignment::Center)
+                .style(if app.show_downloads_menu {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if app.busy {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if app.show_downloads_menu {
+                            Style::default().fg(Color::Cyan)
+                        } else if app.busy {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }),
+                );
+            app.hits.buttons.push((top_cols[3], ButtonAction::ToggleDownloads));
+            f.render_widget(dl_btn, top_cols[3]);
+
             // Top [ Settings ] button
             let settings_active = matches!(app.view, View::Settings);
             let settings_btn = Paragraph::new(" Settings ")
@@ -2409,8 +2778,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             Style::default().fg(Color::DarkGray)
                         }),
                 );
-            app.hits.buttons.push((top_cols[3], ButtonAction::Settings));
-            f.render_widget(settings_btn, top_cols[3]);
+            app.hits.buttons.push((top_cols[4], ButtonAction::Settings));
+            f.render_widget(settings_btn, top_cols[4]);
 
             // 2. Body split
             let body = Layout::default()
@@ -2559,10 +2928,14 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     f.render_widget(empty_search, main_area);
                 } else {
                     let title_max = main_area.width.saturating_sub(28).clamp(16, 48) as usize;
+                    let scroll_off = app.search_state.offset();
+                    let (mx, my) = app.mouse_pos;
+                    let max_y = main_area.y + main_area.height.saturating_sub(1);
                     let items: Vec<ListItem> = app
                         .search_results
                         .iter()
-                        .map(|r| {
+                        .enumerate()
+                        .map(|(i, r)| {
                             let thumb_key = format!("yt:{}", r.id);
                             let thumb_rows = app.thumbs.get_by_key(&thumb_key).cloned();
                             let downloaded = find_cached_track(&app.lib, &r.title, &r.uploader).is_some();
@@ -2599,10 +2972,21 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
 
                             l2.push(Span::styled("        ", Style::default()));
-                            l2.push(Span::styled(
-                                r.uploader.clone(),
-                                Style::default().fg(Color::Cyan),
-                            ));
+                            let mut artist_style = Style::default().fg(Color::Cyan);
+                            if i >= scroll_off {
+                                let row_y2 = main_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
+                                if row_y2 < max_y && !r.uploader.is_empty() {
+                                    // border(1) + highlight(2) + thumb(4) + space(1) + indent(8) = +16
+                                    let ax = main_area.x + 16;
+                                    let aw = (r.uploader.chars().count() as u16).min(main_area.width.saturating_sub(18));
+                                    let arect = Rect::new(ax, row_y2, aw, 1);
+                                    if rect_contains(arect, mx, my) {
+                                        artist_style = artist_style.add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    app.hits.artist_links.push((arect, r.uploader.clone()));
+                                }
+                            }
+                            l2.push(Span::styled(r.uploader.clone(), artist_style));
 
                             ListItem::new(vec![Line::from(l1), Line::from(l2)])
                         })
@@ -2731,9 +3115,12 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     );
                     f.render_widget(act_bar, info_rows[1]);
 
-                    // Artist Top Tracks (2-line rows with 4x2 album cover art)
+                    // Artist Top Tracks (2-line rows with 4x2 album cover art + hover-underlined Artist & Album)
                     app.hits.track_list = artist_rows[1];
                     let title_max = artist_rows[1].width.saturating_sub(28).clamp(16, 46) as usize;
+                    let scroll_off = app.artist_track_state.offset();
+                    let (mx, my) = app.mouse_pos;
+                    let max_y = artist_rows[1].y + artist_rows[1].height.saturating_sub(1);
                     let items: Vec<ListItem> = prof
                         .top_tracks
                         .iter()
@@ -2782,12 +3169,47 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             } else {
                                 "--:--".to_string()
                             };
-                            let mut sub = format!("    {}", tr.artist);
-                            if !tr.album.is_empty() {
-                                sub.push_str(&format!(" - {}", tr.album));
+                            l2.push(Span::raw("    "));
+                            let row_y2_opt = if i >= scroll_off {
+                                let y2 = artist_rows[1].y + 1 + ((i - scroll_off) * 2) as u16 + 1;
+                                (y2 < max_y).then_some(y2)
+                            } else {
+                                None
+                            };
+                            // border(1) + highlight(2) + thumb(4) + space(1) + indent(4) = +12
+                            let mut cur_x = artist_rows[1].x + 12;
+                            let mut a_style = Style::default().fg(Color::Cyan);
+                            let a_len = tr.artist.chars().count() as u16;
+                            if let Some(y2) = row_y2_opt {
+                                if a_len > 0 {
+                                    let arect = Rect::new(cur_x, y2, a_len, 1);
+                                    if rect_contains(arect, mx, my) {
+                                        a_style = a_style.add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    app.hits.artist_links.push((arect, tr.artist.clone()));
+                                }
                             }
-                            sub.push_str(&format!(" | {dur}"));
-                            l2.push(Span::styled(sub, Style::default().fg(Color::Rgb(155, 160, 170))));
+                            l2.push(Span::styled(tr.artist.clone(), a_style));
+                            cur_x += a_len;
+
+                            if !tr.album.is_empty() {
+                                l2.push(Span::styled(" - ", Style::default().fg(Color::Rgb(135, 140, 150))));
+                                cur_x += 3;
+                                let mut al_style = Style::default().fg(Color::Rgb(165, 172, 185));
+                                let al_len = tr.album.chars().count() as u16;
+                                if let Some(y2) = row_y2_opt {
+                                    let alrect = Rect::new(cur_x, y2, al_len, 1);
+                                    if rect_contains(alrect, mx, my) {
+                                        al_style = al_style.add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    app.hits.album_links.push((alrect, tr.artist.clone(), tr.album.clone()));
+                                }
+                                l2.push(Span::styled(tr.album.clone(), al_style));
+                            }
+                            l2.push(Span::styled(
+                                format!(" | {dur}"),
+                                Style::default().fg(Color::Rgb(135, 140, 150)),
+                            ));
 
                             ListItem::new(vec![Line::from(l1), Line::from(l2)])
                         })
@@ -3044,13 +3466,17 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         ("", None),
                         ("Navigation & Search", None),
                         ("/ or s", Some("Focus Search bar")),
+                        ("D", Some("Toggle Downloads dropdown")),
                         ("A / Click Name", Some("Open Artist Profile")),
+                        ("Click Album", Some("Browse Album")),
                         ("f", Some("Like / Follow Artist")),
                         ("a", Some("Import All (Artist/Spotify)")),
                         (", (comma)", Some("Open Settings")),
-                        ("Tab / Esc", Some("Switch pane / Go back")),
+                        ("Tab / Esc", Some("Switch pane / Close / Back")),
                         ("", None),
                         ("Library & Lyrics", None),
+                        ("Click Lyric", Some("Seek to lyric timestamp")),
+                        ("? / Click [?]", Some("Genius lyric explanation")),
                         ("l", Some("Like song (pin from cache)")),
                         ("L", Some("Toggle live lyrics")),
                         ("[ / ] / \\", Some("Lyrics sync -50ms / +50ms / 0")),
@@ -3121,9 +3547,13 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     .collect();
 
                 let title_max = main_area.width.saturating_sub(18).clamp(14, 38) as usize;
+                let scroll_off = app.track_state.offset();
+                let (mx, my) = app.mouse_pos;
+                let max_y = main_area.y + main_area.height.saturating_sub(1);
                 let items: Vec<ListItem> = row_data
                     .into_iter()
-                    .map(|(fname, title, artist, album, liked, lrc_ok, dur_sec, size_b, cov_p)| {
+                    .enumerate()
+                    .map(|(i, (fname, title, artist, album, liked, lrc_ok, dur_sec, size_b, cov_p))| {
                         let thumb_rows = cov_p
                             .as_deref()
                             .and_then(|p| app.thumbs.get_or_load(p))
@@ -3180,14 +3610,46 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         let lrc_s = if lrc_ok { "LRC" } else { "---" };
 
                         line2_spans.push(Span::raw("   "));
+                        let row_y2_opt = if i >= scroll_off {
+                            let y2 = main_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
+                            (y2 < max_y).then_some(y2)
+                        } else {
+                            None
+                        };
+                        // border(1) + highlight(2) + thumb(4) + space(1) + indent(3) = +11
+                        let mut cur_x = main_area.x + 11;
+
                         if !artist.is_empty() {
-                            line2_spans.push(Span::styled(artist, Style::default().fg(Color::Cyan)));
-                            let rest = if !album.is_empty() {
-                                format!(" - {} | {} | {}", album, dur_s, lrc_s)
-                            } else {
-                                format!(" | {} | {}", dur_s, lrc_s)
-                            };
-                            line2_spans.push(Span::styled(rest, Style::default().fg(Color::Rgb(155, 160, 170))));
+                            let mut a_style = Style::default().fg(Color::Cyan);
+                            let a_len = artist.chars().count() as u16;
+                            if let Some(y2) = row_y2_opt {
+                                let arect = Rect::new(cur_x, y2, a_len, 1);
+                                if rect_contains(arect, mx, my) {
+                                    a_style = a_style.add_modifier(Modifier::UNDERLINED);
+                                }
+                                app.hits.artist_links.push((arect, artist.clone()));
+                            }
+                            line2_spans.push(Span::styled(artist.clone(), a_style));
+                            cur_x += a_len;
+
+                            if !album.is_empty() {
+                                line2_spans.push(Span::styled(" - ", Style::default().fg(Color::Rgb(140, 145, 155))));
+                                cur_x += 3;
+                                let mut al_style = Style::default().fg(Color::Rgb(165, 172, 185));
+                                let al_len = album.chars().count() as u16;
+                                if let Some(y2) = row_y2_opt {
+                                    let alrect = Rect::new(cur_x, y2, al_len, 1);
+                                    if rect_contains(alrect, mx, my) {
+                                        al_style = al_style.add_modifier(Modifier::UNDERLINED);
+                                    }
+                                    app.hits.album_links.push((alrect, artist.clone(), album.clone()));
+                                }
+                                line2_spans.push(Span::styled(album, al_style));
+                            }
+                            line2_spans.push(Span::styled(
+                                format!(" | {} | {}", dur_s, lrc_s),
+                                Style::default().fg(Color::Rgb(140, 145, 155)),
+                            ));
                         } else {
                             line2_spans.push(Span::styled(
                                 format!("{} | {} | {}", dur_s, lrc_s, fmt_mb(size_b)),
@@ -3215,8 +3677,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 f.render_stateful_widget(list, main_area, &mut app.track_state);
             }
 
-            // Live Word-by-Word Synced Lyrics panel
+            // Live Word-by-Word Synced Lyrics panel (hover + click-to-seek + [?] Genius)
             if let Some(lrc_area) = lyrics_area_opt {
+                app.hits.lyrics_area = lrc_area;
                 let lrc_title = app
                     .current_track_entry()
                     .map(|e| {
@@ -3227,7 +3690,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         }
                     })
                     .unwrap_or_else(|| " Lyrics ".to_string());
-                let lrc_lines = render_word_synced_lyrics(&app, lrc_area.width, lrc_area.height);
+                let (lrc_lines, lrc_rows, lrc_helps) = render_word_synced_lyrics(&app, lrc_area);
+                app.hits.lyrics_rows = lrc_rows;
+                app.hits.lyric_help_btns = lrc_helps;
                 let lrc_widget = Paragraph::new(lrc_lines)
                     .alignment(Alignment::Center)
                     .block(
@@ -3352,41 +3817,228 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
             ];
 
             let ctrl_line = render_inline_buttons(btn_defs, outer[3], 1, &mut app.hits.buttons);
+            let show_transient = app.busy || (!app.status.is_empty() && app.status_at.elapsed() < Duration::from_secs(4));
+            let ctrl_title = if show_transient {
+                format!(" Controls - {} ", app.status)
+            } else {
+                " Controls ".to_string()
+            };
             let ctrl_bar = Paragraph::new(ctrl_line)
-                .block(Block::default().borders(Borders::ALL).title(" Controls "));
+                .block(Block::default().borders(Borders::ALL).title(ctrl_title));
             f.render_widget(ctrl_bar, outer[3]);
 
-            // 5. Status / Input Prompt
-            let bottom = match &app.input_mode {
-                InputMode::Search => Paragraph::new("Searching... (Enter to submit, Esc to cancel)")
-                    .style(Style::default().fg(Color::Rgb(118, 238, 148)))
-                    .block(Block::default().borders(Borders::ALL)),
-                InputMode::Import => Paragraph::new(format!(
-                    "Spotify URL, YouTube URL, Exportify .csv, or local path: {}_",
-                    app.input_buf
-                ))
-                .style(Style::default().fg(Color::Cyan))
-                .block(Block::default().borders(Borders::ALL).title(" Import Music (Enter import, Esc cancel) ")),
-                InputMode::SpotifyClientId => Paragraph::new(format!(
-                    "Paste Spotify Client ID (Redirect URI: {SPOTIFY_REDIRECT_URI}): {}_",
-                    app.input_buf
-                ))
-                .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title(" Spotify OAuth Login (Enter opens browser, Esc cancel) ")),
-                InputMode::SpotifyAddUrl => Paragraph::new(format!(
-                    "Paste Spotify playlist/album/artist URL or Exportify .csv/.json path: {}_",
-                    app.input_buf
-                ))
-                .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title(" Link Spotify Playlist / Album (Free, no Premium) ")),
-                InputMode::NewPlaylist => Paragraph::new(format!("New playlist name: {}_", app.input_buf))
-                    .style(Style::default().fg(Color::Yellow))
-                    .block(Block::default().borders(Borders::ALL).title(" Create Playlist (Enter save, Esc cancel) ")),
-                _ => Paragraph::new(app.status.as_str())
-                    .style(Style::default().fg(if app.busy { Color::Yellow } else { Color::Gray }))
-                    .block(Block::default().borders(Borders::ALL)),
-            };
-            f.render_widget(bottom, outer[4]);
+            // --- FLOATING OVERLAYS (overlap all UI underneath via Clear) ---
+
+            // Overlay 1: Downloads Dropdown directly under top [ v DL ] button
+            if app.show_downloads_menu {
+                let recent = app.recent_downloaded_tracks(10);
+                let dd_w = 50u16.min(f.area().width.saturating_sub(2));
+                let busy_rows = if app.busy { 2u16 } else { 0 };
+                let dd_h = ((recent.len().max(1) as u16) + busy_rows + 3).min(f.area().height.saturating_sub(4));
+                let dd_x = (top_cols[3].x + top_cols[3].width)
+                    .saturating_sub(dd_w)
+                    .min(f.area().width.saturating_sub(dd_w));
+                let dd_y = outer[0].y + outer[0].height;
+                let dd_rect = Rect::new(dd_x, dd_y, dd_w, dd_h);
+                app.hits.dl_dropdown = dd_rect;
+
+                f.render_widget(Clear, dd_rect);
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                let mut cur_y = dd_rect.y + 1;
+                if app.busy {
+                    lines.push(Line::from(Span::styled(
+                        format!(" > {}", app.status),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "─".repeat(dd_rect.width.saturating_sub(2) as usize),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    cur_y += 2;
+                }
+                if recent.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        " No downloaded songs yet",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    let inner_w = dd_rect.width.saturating_sub(2) as usize;
+                    let (mx, my) = app.mouse_pos;
+                    for (fname, title, artist, sz) in recent {
+                        if cur_y >= dd_rect.y + dd_rect.height.saturating_sub(1) {
+                            break;
+                        }
+                        let sz_s = fmt_mb(sz);
+                        let right_part = format!(" {sz_s} [x]");
+                        let max_left = inner_w.saturating_sub(right_part.chars().count() + 1);
+                        let mut label = if artist.is_empty() {
+                            title
+                        } else {
+                            format!("{title} - {artist}")
+                        };
+                        if label.chars().count() > max_left {
+                            label = label
+                                .chars()
+                                .take(max_left.saturating_sub(2))
+                                .collect::<String>()
+                                + "..";
+                        }
+                        let pad = max_left.saturating_sub(label.chars().count());
+                        let del_x = dd_rect.x + 1 + (inner_w.saturating_sub(3)) as u16;
+                        let del_rect = Rect::new(del_x, cur_y, 3, 1);
+                        let play_rect = Rect::new(
+                            dd_rect.x + 1,
+                            cur_y,
+                            dd_rect.width.saturating_sub(5),
+                            1,
+                        );
+                        let row_hov = rect_contains(play_rect, mx, my);
+                        let del_hov = rect_contains(del_rect, mx, my);
+                        app.hits.dl_play_rows.push((play_rect, fname.clone()));
+                        app.hits.dl_del_btns.push((del_rect, fname));
+
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!(" {label}{}", " ".repeat(pad)),
+                                if row_hov {
+                                    Style::default()
+                                        .fg(Color::Rgb(118, 238, 148))
+                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                                } else {
+                                    Style::default().fg(Color::Rgb(235, 237, 242))
+                                },
+                            ),
+                            Span::styled(
+                                format!(" {sz_s} "),
+                                Style::default().fg(Color::Rgb(125, 130, 140)),
+                            ),
+                            Span::styled(
+                                "[x]",
+                                if del_hov {
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Red)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Red)
+                                },
+                            ),
+                        ]));
+                        cur_y += 1;
+                    }
+                }
+                let dd_widget = Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .style(Style::default().bg(Color::Rgb(20, 22, 26)))
+                        .title(" Recent Downloads "),
+                );
+                f.render_widget(dd_widget, dd_rect);
+            }
+
+            // Overlay 2: Floating Input Modal (only appears when actively entering Import / Playlist / Spotify URL)
+            if matches!(
+                app.input_mode,
+                InputMode::Import
+                    | InputMode::SpotifyClientId
+                    | InputMode::SpotifyAddUrl
+                    | InputMode::NewPlaylist
+            ) {
+                let mw = 68u16.min(f.area().width.saturating_sub(4));
+                let mh = 5u16;
+                let mx = f.area().x + (f.area().width.saturating_sub(mw)) / 2;
+                let my = f.area().y + (f.area().height.saturating_sub(mh)) / 2;
+                let modal_rect = Rect::new(mx, my, mw, mh);
+                f.render_widget(Clear, modal_rect);
+                let (title, prompt, color) = match &app.input_mode {
+                    InputMode::Import => (
+                        " Import Music ",
+                        format!(" URL, Exportify .csv, or path: {}_", app.input_buf),
+                        Color::Cyan,
+                    ),
+                    InputMode::SpotifyClientId => (
+                        " Spotify OAuth Login ",
+                        format!(" Client ID ({SPOTIFY_REDIRECT_URI}): {}_", app.input_buf),
+                        Color::Green,
+                    ),
+                    InputMode::SpotifyAddUrl => (
+                        " Link Spotify Playlist / Album ",
+                        format!(" Spotify URL or .csv/.json path: {}_", app.input_buf),
+                        Color::Green,
+                    ),
+                    InputMode::NewPlaylist => (
+                        " New Playlist ",
+                        format!(" Name: {}_", app.input_buf),
+                        Color::Yellow,
+                    ),
+                    _ => ("", String::new(), Color::White),
+                };
+                let modal = Paragraph::new(vec![Line::from(""), Line::from(prompt)])
+                    .style(Style::default().fg(color).bg(Color::Rgb(20, 22, 26)))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(color))
+                            .title(title),
+                    );
+                f.render_widget(modal, modal_rect);
+            }
+
+            // Overlay 3: Genius Lyric Explanation Popup
+            if let Some(pop) = &app.genius_popup {
+                let pw = 68u16.min(f.area().width.saturating_sub(4));
+                let ph = 18u16.min(f.area().height.saturating_sub(4));
+                let px = f.area().x + (f.area().width.saturating_sub(pw)) / 2;
+                let py = f.area().y + (f.area().height.saturating_sub(ph)) / 2;
+                let prect = Rect::new(px, py, pw, ph);
+                app.hits.popup_rect = prect;
+                f.render_widget(Clear, prect);
+
+                let close_rect = Rect::new(px + pw.saturating_sub(12), py, 10, 1);
+                app.hits.buttons.push((close_rect, ButtonAction::ClosePopup));
+
+                let mut plines = vec![
+                    Line::from(Span::styled(
+                        format!(" \"{}\"", pop.lyric_line),
+                        Style::default()
+                            .fg(Color::Rgb(118, 238, 148))
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ];
+                if !pop.fragment.is_empty() && pop.fragment != pop.lyric_line {
+                    plines.push(Line::from(Span::styled(
+                        format!(" Genius bar: {}", pop.fragment.replace('\n', " / ")),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                    plines.push(Line::from(""));
+                }
+                for para in pop.explanation.lines() {
+                    plines.push(Line::from(Span::styled(
+                        format!(" {para}"),
+                        Style::default().fg(Color::Rgb(230, 232, 238)),
+                    )));
+                }
+                if !pop.url.is_empty() {
+                    plines.push(Line::from(""));
+                    plines.push(Line::from(Span::styled(
+                        format!(" {}", pop.url),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+
+                let pwidget = Paragraph::new(plines)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().bg(Color::Rgb(20, 22, 26)))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(format!(" Genius - {} [ Esc / Close ] ", pop.song_title)),
+                    );
+                f.render_widget(pwidget, prect);
+            }
         })?;
 
         let poll_ms = if app.pb.active && !app.pb.paused { 16 } else { 45 };
@@ -3399,6 +4051,21 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     }
                     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                         break;
+                    }
+                    // Dismiss Genius popup or Downloads dropdown cleanly on Esc
+                    if key.code == KeyCode::Esc {
+                        if app.genius_popup.is_some() {
+                            app.genius_popup = None;
+                            continue;
+                        }
+                        if app.show_downloads_menu {
+                            app.show_downloads_menu = false;
+                            continue;
+                        }
+                    }
+                    if app.genius_popup.is_some() && matches!(key.code, KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('?')) {
+                        app.genius_popup = None;
+                        continue;
                     }
                     match &app.input_mode {
                         InputMode::Search => match key.code {
@@ -3558,6 +4225,17 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             KeyCode::Char(']') => app.adjust_lrc_offset(Some(50)),
                             KeyCode::Char('\\') => app.adjust_lrc_offset(None),
                             KeyCode::Char(',') => app.open_settings_view(),
+                            KeyCode::Char('D') => app.trigger_button(ButtonAction::ToggleDownloads),
+                            KeyCode::Char('?') => {
+                                let off = app
+                                    .current_track_entry()
+                                    .map(|e| e.lrc_offset_ms as f64 / 1000.0)
+                                    .unwrap_or(0.0);
+                                let pos = app.smooth_pos + off;
+                                if let Some(idx) = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos) {
+                                    app.open_genius_for_lyric(idx);
+                                }
+                            }
                             KeyCode::Char('i') => app.trigger_button(ButtonAction::Import),
                             KeyCode::Char('/') | KeyCode::Char('s') => app.trigger_button(ButtonAction::SearchBtn),
                             KeyCode::Char('l') => app.trigger_button(ButtonAction::Like),
