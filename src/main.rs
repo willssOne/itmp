@@ -147,6 +147,8 @@ enum ButtonAction {
     VolUp,
     Import,
     ToggleLyrics,
+    LyricsReturn,
+    OpenQueue,
     CacheDec,
     CacheInc,
     PruneCache,
@@ -211,6 +213,8 @@ struct App {
     show_lyrics_pane: bool,
 
     queue: VecDeque<String>,
+    play_context: Vec<String>,
+    upcoming: VecDeque<String>,
     history: Vec<String>,
     shuffle: bool,
     repeat: RepeatMode,
@@ -218,6 +222,7 @@ struct App {
 
     lrc_lines: Vec<LrcLine>,
     lrc_file: Option<String>,
+    lyrics_scroll_offset: isize,
     cover_art: Option<CoverArt>,
     cover_size: (u16, u16),
     thumbs: ThumbCache,
@@ -296,12 +301,15 @@ impl App {
             track_state: ListState::default(),
             show_lyrics_pane: true,
             queue: VecDeque::new(),
+            play_context: Vec::new(),
+            upcoming: VecDeque::new(),
             history: Vec::new(),
             shuffle: false,
             repeat: RepeatMode::All,
             rng_seed: now_ts() ^ 0x9e37_79b9_7f4a_7c15,
             lrc_lines: Vec::new(),
             lrc_file: None,
+            lyrics_scroll_offset: 0,
             cover_art: None,
             cover_size: (0, 0),
             thumbs: ThumbCache::default(),
@@ -336,6 +344,8 @@ impl App {
             rx,
         };
         app.rebuild_track_list();
+        app.play_context = app.track_list.clone();
+        app.rebuild_upcoming(None);
         app
     }
 
@@ -363,7 +373,7 @@ impl App {
                 SidebarEntry::Liked,
             ),
             (
-                format!("Queue ({})", self.queue.len()),
+                format!("Queue ({})", self.queue.len() + self.upcoming.len()),
                 SidebarEntry::Queue,
             ),
         ];
@@ -449,7 +459,11 @@ impl App {
                 keys.sort();
                 keys
             }
-            View::Queue => self.queue.iter().cloned().collect(),
+            View::Queue => {
+                let mut combined: Vec<String> = self.queue.iter().cloned().collect();
+                combined.extend(self.upcoming.iter().cloned());
+                combined
+            }
             View::Playlist(idx) => self
                 .lib
                 .playlists
@@ -479,7 +493,90 @@ impl App {
                 self.sidebar_state.select(Some(0));
             }
         }
+        if !self.lib.entries.is_empty() {
+            self.play_context.retain(|f| self.lib.entries.contains_key(f));
+            self.upcoming.retain(|f| self.lib.entries.contains_key(f));
+            self.queue.retain(|f| self.lib.entries.contains_key(f));
+            if self.play_context.is_empty() {
+                let mut k: Vec<String> = self.lib.entries.keys().cloned().collect();
+                k.sort();
+                self.play_context = k;
+                let cur = self.player.current_file.clone();
+                self.rebuild_upcoming(cur.as_deref());
+            }
+        }
         self.rebuild_track_list();
+    }
+
+    fn rebuild_upcoming(&mut self, current_file: Option<&str>) {
+        let mut pool: Vec<String> = if !self.play_context.is_empty() {
+            self.play_context
+                .iter()
+                .filter(|f| self.lib.entries.contains_key(*f))
+                .cloned()
+                .collect()
+        } else {
+            let mut k: Vec<String> = self.lib.entries.keys().cloned().collect();
+            k.sort();
+            k
+        };
+        self.upcoming.clear();
+        if pool.is_empty() {
+            return;
+        }
+        if self.shuffle {
+            if let Some(cur) = current_file {
+                pool.retain(|x| x != cur);
+            }
+            // Fisher-Yates shuffle so Queue shows exact upcoming shuffled order
+            for i in (1..pool.len()).rev() {
+                let j = self.next_rand(i + 1);
+                pool.swap(i, j);
+            }
+            self.upcoming = pool.into();
+        } else if let Some(cur) = current_file {
+            if let Some(pos) = pool.iter().position(|x| x == cur) {
+                for x in &pool[pos + 1..] {
+                    self.upcoming.push_back(x.clone());
+                }
+                if self.repeat == RepeatMode::All {
+                    for x in &pool[..pos] {
+                        self.upcoming.push_back(x.clone());
+                    }
+                }
+            } else {
+                self.upcoming = pool.into();
+            }
+        } else {
+            self.upcoming = pool.into();
+        }
+        if matches!(self.view, View::Queue) {
+            self.rebuild_track_list();
+        }
+    }
+
+    fn play_from_queue_index(&mut self, idx: usize) {
+        if idx < self.queue.len() {
+            if let Some(fname) = self.queue.remove(idx) {
+                self.play_filename_internal(&fname, true, false);
+                self.rebuild_track_list();
+            }
+        } else {
+            let u_idx = idx - self.queue.len();
+            if u_idx < self.upcoming.len() {
+                let mut picked = None;
+                for _ in 0..=u_idx {
+                    picked = self.upcoming.pop_front();
+                }
+                if let Some(fname) = picked {
+                    self.play_filename_internal(&fname, true, false);
+                    if self.upcoming.is_empty() && self.repeat == RepeatMode::All {
+                        self.rebuild_upcoming(Some(&fname));
+                    }
+                    self.rebuild_track_list();
+                }
+            }
+        }
     }
 
     fn selected_track(&self) -> Option<String> {
@@ -499,9 +596,22 @@ impl App {
     }
 
     fn play_filename(&mut self, fname: &str, record_history: bool) {
+        if !matches!(self.view, View::Queue | View::Search | View::Artist | View::Settings)
+            && !self.track_list.is_empty()
+        {
+            self.play_context = self.track_list.clone();
+        } else if self.play_context.is_empty() {
+            let mut k: Vec<String> = self.lib.entries.keys().cloned().collect();
+            k.sort();
+            self.play_context = k;
+        }
+        self.play_filename_internal(fname, record_history, true);
+    }
+
+    fn play_filename_internal(&mut self, fname: &str, record_history: bool, rebuild_up: bool) {
         let full = self.dir.join(fname);
         if !full.is_file() {
-            self.status = format!("File missing: {fname}");
+            self.set_notice(format!("File missing: {fname}"));
             return;
         }
         if record_history {
@@ -525,14 +635,17 @@ impl App {
                     } else {
                         format!("{} - {}", e.title, e.artist)
                     };
-                    self.status = format!("Playing: {label}");
+                    self.set_notice(format!("Playing: {label}"));
                 }
                 save_library(&self.dir, &self.lib);
                 self.refresh_lyrics_for(fname);
                 self.cover_art = None;
+                if rebuild_up {
+                    self.rebuild_upcoming(Some(fname));
+                }
             }
             Err(e) => {
-                self.status = format!("Playback error: {e}");
+                self.set_notice(format!("Playback error: {e}"));
             }
         }
     }
@@ -719,6 +832,8 @@ impl App {
             pl.tracks.retain(|x| x != fname);
         }
         self.queue.retain(|x| x != fname);
+        self.upcoming.retain(|x| x != fname);
+        self.play_context.retain(|x| x != fname);
         save_library(&self.dir, &self.lib);
         self.rebuild_track_list();
         self.set_notice(format!("Deleted '{title}'"));
@@ -831,6 +946,7 @@ impl App {
         }
         self.lrc_lines = load_lrc(&self.dir, fname, None);
         self.lrc_file = Some(fname.to_string());
+        self.lyrics_scroll_offset = 0;
 
         if !self.lrc_lines.is_empty() {
             let dir = self.dir.clone();
@@ -920,52 +1036,56 @@ impl App {
         self.artist_avatar_size = (cols, rows);
     }
 
+    fn scroll_lyrics(&mut self, delta: isize) {
+        if self.lrc_lines.is_empty() {
+            self.lyrics_scroll_offset = 0;
+            return;
+        }
+        let off = self
+            .current_track_entry()
+            .map(|e| e.lrc_offset_ms as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let pos = self.smooth_pos + off;
+        let active_idx = self
+            .lrc_lines
+            .iter()
+            .rposition(|l| l.time_sec <= pos)
+            .unwrap_or(0) as isize;
+        let max_idx = self.lrc_lines.len().saturating_sub(1) as isize;
+        let min_off = -active_idx;
+        let max_off = max_idx - active_idx;
+        self.lyrics_scroll_offset = (self.lyrics_scroll_offset + delta).clamp(min_off, max_off);
+    }
+
     fn play_next(&mut self) {
         if let Some(q) = self.queue.pop_front() {
+            self.play_filename_internal(&q, true, false);
             if matches!(self.view, View::Queue) {
                 self.rebuild_track_list();
             }
-            self.play_filename(&q, true);
-            return;
-        }
-        let pool: Vec<String> = if !self.track_list.is_empty() && !matches!(self.view, View::Queue) {
-            self.track_list.clone()
-        } else {
-            let mut k: Vec<String> = self.lib.entries.keys().cloned().collect();
-            k.sort();
-            k
-        };
-        if pool.is_empty() {
             return;
         }
         if self.repeat == RepeatMode::One {
             if let Some(cur) = self.player.current_file.clone() {
-                self.play_filename(&cur, false);
+                self.play_filename_internal(&cur, false, false);
                 return;
             }
         }
-        if self.shuffle {
-            let idx = self.next_rand(pool.len());
-            let choice = pool[idx].clone();
-            self.play_filename(&choice, true);
-            return;
+        if self.upcoming.is_empty() && self.repeat == RepeatMode::All {
+            let cur = self.player.current_file.clone();
+            self.rebuild_upcoming(cur.as_deref());
         }
-        if let Some(cur) = &self.player.current_file {
-            if let Some(pos) = pool.iter().position(|x| x == cur) {
-                if pos + 1 < pool.len() {
-                    let next = pool[pos + 1].clone();
-                    self.play_filename(&next, true);
-                } else if self.repeat == RepeatMode::All {
-                    let first = pool[0].clone();
-                    self.play_filename(&first, true);
-                } else {
-                    self.was_playing_file = false;
-                }
-                return;
+        if let Some(next) = self.upcoming.pop_front() {
+            self.play_filename_internal(&next, true, false);
+            if self.upcoming.is_empty() && self.repeat == RepeatMode::All {
+                self.rebuild_upcoming(Some(&next));
             }
+            if matches!(self.view, View::Queue) {
+                self.rebuild_track_list();
+            }
+        } else {
+            self.was_playing_file = false;
         }
-        let first = pool[0].clone();
-        self.play_filename(&first, true);
     }
 
     fn play_prev(&mut self) {
@@ -1754,11 +1874,15 @@ impl App {
             ButtonAction::Next => self.play_next(),
             ButtonAction::Shuffle => {
                 self.shuffle = !self.shuffle;
-                self.status = format!("Shuffle: {}", if self.shuffle { "on" } else { "off" });
+                let cur = self.player.current_file.clone();
+                self.rebuild_upcoming(cur.as_deref());
+                self.set_notice(format!("Shuffle: {}", if self.shuffle { "on" } else { "off" }));
             }
             ButtonAction::Repeat => {
                 self.repeat = self.repeat.next();
-                self.status = format!("Repeat: {}", self.repeat.label());
+                let cur = self.player.current_file.clone();
+                self.rebuild_upcoming(cur.as_deref());
+                self.set_notice(format!("Repeat: {}", self.repeat.label()));
             }
             ButtonAction::Like => self.toggle_like(),
             ButtonAction::VolDown => {
@@ -1777,10 +1901,20 @@ impl App {
             }
             ButtonAction::ToggleLyrics => {
                 self.show_lyrics_pane = !self.show_lyrics_pane;
-                self.status = format!(
+                self.set_notice(format!(
                     "Live lyrics: {}",
                     if self.show_lyrics_pane { "on" } else { "off" }
-                );
+                ));
+            }
+            ButtonAction::LyricsReturn => {
+                self.lyrics_scroll_offset = 0;
+            }
+            ButtonAction::OpenQueue => {
+                self.view = View::Queue;
+                self.sidebar_state.select(Some(2));
+                self.focus = Focus::Main;
+                self.input_mode = InputMode::Normal;
+                self.rebuild_track_list();
             }
             ButtonAction::CacheDec => self.adjust_cache_limit(-100),
             ButtonAction::CacheInc => self.adjust_cache_limit(100),
@@ -1845,6 +1979,8 @@ impl App {
                 if rect_contains(self.hits.controls_bar, col, row) {
                     let v = self.player.volume + 5;
                     self.player.set_volume(v);
+                } else if rect_contains(self.hits.lyrics_area, col, row) {
+                    self.scroll_lyrics(-2);
                 } else {
                     self.move_cursor(-1);
                 }
@@ -1853,6 +1989,8 @@ impl App {
                 if rect_contains(self.hits.controls_bar, col, row) {
                     let v = self.player.volume - 5;
                     self.player.set_volume(v);
+                } else if rect_contains(self.hits.lyrics_area, col, row) {
+                    self.scroll_lyrics(2);
                 } else {
                     self.move_cursor(1);
                 }
@@ -1920,13 +2058,14 @@ impl App {
                     }
                 }
 
-                // 5. Click anywhere on a lyric line -> seek straight to that timestamp!
+                // 5. Click anywhere on a lyric line -> seek straight to that timestamp & snap back!
                 if rect_contains(self.hits.lyrics_area, col, row) {
                     let lrows = self.hits.lyrics_rows.clone();
                     if let Some(&(_, _, target_sec)) = lrows.iter().find(|&&(y, _, _)| y == row) {
                         if self.pb.active {
                             self.player.seek_abs(target_sec);
                             self.smooth_pos = target_sec;
+                            self.lyrics_scroll_offset = 0;
                             self.set_notice(format!("Seeked to {}", fmt_time(target_sec)));
                         }
                         return;
@@ -2117,10 +2256,10 @@ impl App {
                                 self.last_click = Some((idx, Instant::now()));
                                 if already_sel || quick_repeat {
                                     if matches!(self.view, View::Queue) {
-                                        self.queue.remove(idx);
-                                        self.rebuild_track_list();
+                                        self.play_from_queue_index(idx);
+                                    } else {
+                                        self.play_filename(&fname, true);
                                     }
-                                    self.play_filename(&fname, true);
                                 }
                             }
                         }
@@ -2321,14 +2460,14 @@ fn wrap_plain_text(text: &str, max_w: usize) -> Vec<String> {
     rows
 }
 
-/// Clean, vertically-centered truecolor word-by-word synced lyrics with hover highlight,
-/// click-to-seek timestamp mapping, and clickable `[?]` Genius explanation triggers.
+/// Clean, vertically-centered truecolor word-by-word synced lyrics with manual scrolling,
+/// hover highlight, click-to-seek timestamp mapping, and clickable `[?]` Genius triggers.
 fn render_word_synced_lyrics(
     app: &App,
     lrc_area: Rect,
 ) -> (Vec<Line<'static>>, Vec<(u16, usize, f64)>, Vec<(Rect, usize)>) {
     let h = lrc_area.height.saturating_sub(2) as usize;
-    let inner_w = lrc_area.width.saturating_sub(8).max(16) as usize; // leave 4 cols on right for `[?]`
+    let inner_w = lrc_area.width.saturating_sub(8).max(16) as usize;
     let (mx, my) = app.mouse_pos;
     let mouse_in_lyrics = rect_contains(lrc_area, mx, my);
 
@@ -2353,252 +2492,278 @@ fn render_word_synced_lyrics(
     let pos = app.smooth_pos + offset_sec;
 
     let active_opt = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos);
-    let Some(active_idx) = active_opt else {
-        let mut out = Vec::new();
-        let mut row_map = Vec::new();
-        let pad = h.saturating_sub(4) / 2;
-        for _ in 0..pad {
-            out.push(Line::from(""));
-        }
-        out.push(Line::from(Span::styled(
-            "...",
-            Style::default().fg(Color::Rgb(95, 95, 102)),
-        )));
-        out.push(Line::from(""));
-        for (li, l) in app.lrc_lines.iter().take(3).enumerate() {
-            for r in wrap_plain_text(&l.text, inner_w) {
-                let sy = lrc_area.y + 1 + out.len() as u16;
-                row_map.push((sy, li, l.time_sec));
-                out.push(Line::from(Span::styled(
-                    r,
-                    Style::default().fg(Color::Rgb(68, 68, 76)),
-                )));
+    let active_idx = active_opt.unwrap_or(0);
+    let has_started = active_opt.is_some();
+
+    let max_idx = app.lrc_lines.len().saturating_sub(1);
+    let view_idx = (active_idx as isize + app.lyrics_scroll_offset).clamp(0, max_idx as isize) as usize;
+
+    // Helper to build the live word-by-word active bar rows + hairline
+    let build_active_block = || -> (Vec<Vec<Span<'static>>>, Line<'static>) {
+        let active_entry = &app.lrc_lines[active_idx];
+        let mut active_rows: Vec<Vec<Span<'static>>> = Vec::new();
+        let mut current_row: Vec<Span<'static>> = Vec::new();
+        let mut row_len = 0usize;
+        let mut bar_start = f64::MAX;
+        let mut bar_end = 0.0f64;
+
+        for (wi, w) in active_entry.words.iter().enumerate() {
+            bar_start = bar_start.min(w.start);
+            bar_end = bar_end.max(w.end);
+
+            let w_chars: Vec<char> = w.text.chars().collect();
+            let w_len = w_chars.len();
+            let need_space = if current_row.is_empty() { 0 } else { 1 };
+            if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
+                active_rows.push(std::mem::take(&mut current_row));
+                row_len = 0;
+            }
+            if !current_row.is_empty() {
+                current_row.push(Span::raw(" "));
+                row_len += 1;
+            }
+
+            let dur = (w.end - w.start).max(0.07);
+            let (active_fg, unlit_active_fg, sung_style, upcoming_fg) = if w.is_adlib {
+                (
+                    Color::Rgb(242, 202, 92),
+                    Color::Rgb(138, 122, 82),
+                    Style::default().fg(Color::Rgb(192, 166, 98)),
+                    Color::Rgb(84, 84, 92),
+                )
+            } else {
+                (
+                    Color::Rgb(118, 238, 148),
+                    Color::Rgb(132, 136, 144),
+                    Style::default()
+                        .fg(Color::Rgb(244, 244, 246))
+                        .add_modifier(Modifier::BOLD),
+                    Color::Rgb(96, 98, 106),
+                )
+            };
+
+            if pos >= w.end {
+                current_row.push(Span::styled(w.text.clone(), sung_style));
+            } else if pos >= w.start {
+                let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
+                let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
+                let lit: String = w_chars[..split_at].iter().collect();
+                let rest: String = w_chars[split_at..].iter().collect();
+                current_row.push(Span::styled(
+                    lit,
+                    Style::default().fg(active_fg).add_modifier(Modifier::BOLD),
+                ));
+                if !rest.is_empty() {
+                    current_row.push(Span::styled(rest, Style::default().fg(unlit_active_fg)));
+                }
+            } else {
+                current_row.push(Span::styled(w.text.clone(), Style::default().fg(upcoming_fg)));
+            }
+            row_len += w_len;
+
+            if wi + 1 == active_entry.words.len() && !current_row.is_empty() {
+                active_rows.push(std::mem::take(&mut current_row));
             }
         }
-        return (out, row_map, Vec::new());
+
+        let bar_w = inner_w.min(26).max(8);
+        let bar_frac = if bar_end > bar_start {
+            ((pos - bar_start) / (bar_end - bar_start)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let filled = ((bar_w as f64) * bar_frac).round() as usize;
+        let bar_line = Line::from(vec![
+            Span::styled(
+                "─".repeat(filled),
+                Style::default().fg(Color::Rgb(118, 238, 148)),
+            ),
+            Span::styled(
+                "─".repeat(bar_w.saturating_sub(filled)),
+                Style::default().fg(Color::Rgb(46, 48, 54)),
+            ),
+        ]);
+        (active_rows, bar_line)
     };
 
-    // Build active bar lines (word-by-word + simultaneous adlibs)
-    let active_entry = &app.lrc_lines[active_idx];
-    let mut active_rows: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut current_row: Vec<Span<'static>> = Vec::new();
-    let mut row_len = 0usize;
-
-    let mut bar_start = f64::MAX;
-    let mut bar_end = 0.0f64;
-
-    for (wi, w) in active_entry.words.iter().enumerate() {
-        bar_start = bar_start.min(w.start);
-        bar_end = bar_end.max(w.end);
-
-        let w_chars: Vec<char> = w.text.chars().collect();
-        let w_len = w_chars.len();
-        let need_space = if current_row.is_empty() { 0 } else { 1 };
-        if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
-            active_rows.push(std::mem::take(&mut current_row));
-            row_len = 0;
-        }
-        if !current_row.is_empty() {
-            current_row.push(Span::raw(" "));
-            row_len += 1;
-        }
-
-        let dur = (w.end - w.start).max(0.07);
-        let (active_fg, unlit_active_fg, sung_style, upcoming_fg) = if w.is_adlib {
-            (
-                Color::Rgb(242, 202, 92),
-                Color::Rgb(138, 122, 82),
-                Style::default().fg(Color::Rgb(192, 166, 98)),
-                Color::Rgb(84, 84, 92),
-            )
-        } else {
-            (
-                Color::Rgb(118, 238, 148),
-                Color::Rgb(132, 136, 144),
-                Style::default()
-                    .fg(Color::Rgb(244, 244, 246))
-                    .add_modifier(Modifier::BOLD),
-                Color::Rgb(96, 98, 106),
-            )
-        };
-
-        if pos >= w.end {
-            current_row.push(Span::styled(w.text.clone(), sung_style));
-        } else if pos >= w.start {
-            let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
-            let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
-            let lit: String = w_chars[..split_at].iter().collect();
-            let rest: String = w_chars[split_at..].iter().collect();
-            current_row.push(Span::styled(
-                lit,
-                Style::default().fg(active_fg).add_modifier(Modifier::BOLD),
-            ));
-            if !rest.is_empty() {
-                current_row.push(Span::styled(rest, Style::default().fg(unlit_active_fg)));
-            }
-        } else {
-            current_row.push(Span::styled(w.text.clone(), Style::default().fg(upcoming_fg)));
-        }
-        row_len += w_len;
-
-        if wi + 1 == active_entry.words.len() && !current_row.is_empty() {
-            active_rows.push(std::mem::take(&mut current_row));
-        }
-    }
-
-    let bar_w = inner_w.min(26).max(8);
-    let bar_frac = if bar_end > bar_start {
-        ((pos - bar_start) / (bar_end - bar_start)).clamp(0.0, 1.0)
+    let (active_rows_opt, bar_line_opt) = if has_started {
+        let (ar, bl) = build_active_block();
+        (Some(ar), Some(bl))
     } else {
-        0.0
+        (None, None)
     };
-    let filled = ((bar_w as f64) * bar_frac).round() as usize;
-    let bar_line = Line::from(vec![
-        Span::styled(
-            "─".repeat(filled),
-            Style::default().fg(Color::Rgb(118, 238, 148)),
-        ),
-        Span::styled(
-            "─".repeat(bar_w.saturating_sub(filled)),
-            Style::default().fg(Color::Rgb(46, 48, 54)),
-        ),
-    ]);
 
-    let active_block_h = 1 + active_rows.len() + 1 + 1;
-    let avail_above = h.saturating_sub(active_block_h) / 2;
-    let avail_below = h.saturating_sub(active_block_h + avail_above);
+    // Build centered viewport rows around `view_idx` (so scrolling smoothly moves through ALL lyrics!)
+    enum RawRow {
+        Blank,
+        Plain {
+            text: String,
+            idx: usize,
+            t: f64,
+            color: Color,
+        },
+        Active {
+            spans: Vec<Span<'static>>,
+            idx: usize,
+            t: f64,
+            show_help: bool,
+        },
+        Bar(Line<'static>),
+    }
 
-    // Collect plain rows above active_idx: (text, lrc_idx, time_sec, base_color)
-    let mut above_raw: Vec<(String, usize, f64, Color)> = Vec::new();
-    for back in 1..=active_idx {
-        if above_raw.len() >= avail_above {
+    let make_line_rows = |idx: usize, is_center_focus: bool| -> Vec<RawRow> {
+        if has_started && idx == active_idx {
+            let mut v = Vec::new();
+            v.push(RawRow::Blank);
+            if let Some(ref ar) = active_rows_opt {
+                let t = app.lrc_lines[idx].time_sec;
+                for (ri, sp) in ar.iter().enumerate() {
+                    v.push(RawRow::Active {
+                        spans: sp.clone(),
+                        idx,
+                        t,
+                        show_help: ri == 0,
+                    });
+                }
+            }
+            if let Some(ref bl) = bar_line_opt {
+                v.push(RawRow::Bar(bl.clone()));
+            }
+            v.push(RawRow::Blank);
+            v
+        } else {
+            let dist = idx.abs_diff(if has_started { active_idx } else { view_idx });
+            let color = if app.lyrics_scroll_offset != 0 && is_center_focus {
+                Color::Rgb(126, 130, 142)
+            } else if dist == 1 {
+                Color::Rgb(82, 82, 90)
+            } else {
+                Color::Rgb(56, 56, 62)
+            };
+            let t = app.lrc_lines[idx].time_sec;
+            wrap_plain_text(&app.lrc_lines[idx].text, inner_w)
+                .into_iter()
+                .map(|text| RawRow::Plain { text, idx, t, color })
+                .collect()
+        }
+    };
+
+    let center_rows = make_line_rows(view_idx, true);
+    let avail_above = h.saturating_sub(center_rows.len()) / 2;
+    let avail_below = h.saturating_sub(center_rows.len() + avail_above);
+
+    let mut above_rows: Vec<RawRow> = Vec::new();
+    for back in 1..=view_idx {
+        if above_rows.len() >= avail_above {
             break;
         }
-        let idx = active_idx - back;
-        let color = if back == 1 {
-            Color::Rgb(82, 82, 90)
-        } else {
-            Color::Rgb(54, 54, 60)
-        };
-        let t = app.lrc_lines[idx].time_sec;
-        for row in wrap_plain_text(&app.lrc_lines[idx].text, inner_w).into_iter().rev() {
-            if above_raw.len() >= avail_above {
+        let idx = view_idx - back;
+        for r in make_line_rows(idx, false).into_iter().rev() {
+            if above_rows.len() >= avail_above {
                 break;
             }
-            above_raw.push((row, idx, t, color));
+            above_rows.push(r);
         }
     }
-    above_raw.reverse();
+    above_rows.reverse();
 
-    let mut below_raw: Vec<(String, usize, f64, Color)> = Vec::new();
+    let mut below_rows: Vec<RawRow> = Vec::new();
     for fwd in 1.. {
-        let idx = active_idx + fwd;
-        if idx >= app.lrc_lines.len() || below_raw.len() >= avail_below {
+        let idx = view_idx + fwd;
+        if idx >= app.lrc_lines.len() || below_rows.len() >= avail_below {
             break;
         }
-        let color = if fwd == 1 {
-            Color::Rgb(82, 82, 90)
-        } else {
-            Color::Rgb(54, 54, 60)
-        };
-        let t = app.lrc_lines[idx].time_sec;
-        for row in wrap_plain_text(&app.lrc_lines[idx].text, inner_w) {
-            if below_raw.len() >= avail_below {
+        for r in make_line_rows(idx, false) {
+            if below_rows.len() >= avail_below {
                 break;
             }
-            below_raw.push((row, idx, t, color));
+            below_rows.push(r);
         }
     }
+
+    let mut all_raw = Vec::with_capacity(h);
+    for _ in 0..avail_above.saturating_sub(above_rows.len()) {
+        all_raw.push(RawRow::Blank);
+    }
+    all_raw.extend(above_rows);
+    all_raw.extend(center_rows);
+    all_raw.extend(below_rows);
 
     let mut out: Vec<Line<'static>> = Vec::with_capacity(h);
     let mut row_map: Vec<(u16, usize, f64)> = Vec::new();
     let mut help_btns: Vec<(Rect, usize)> = Vec::new();
     let box_inner_w = lrc_area.width.saturating_sub(2) as usize;
 
-    let push_centered_dim = |out: &mut Vec<Line<'static>>,
-                             row_map: &mut Vec<(u16, usize, f64)>,
-                             help_btns: &mut Vec<(Rect, usize)>,
-                             text: String,
-                             idx: usize,
-                             t: f64,
-                             base_color: Color| {
+    for raw in all_raw.into_iter().take(h) {
         let sy = lrc_area.y + 1 + out.len() as u16;
-        let hovered = mouse_in_lyrics && my == sy;
-        row_map.push((sy, idx, t));
-        if hovered {
-            let line_str = format!("{text} [?]");
-            let total_chars = line_str.chars().count();
-            let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
-            let q_x = lrc_area.x + 1 + (left_pad + text.chars().count() + 1) as u16;
-            let q_rect = Rect::new(q_x, sy, 3, 1);
-            let q_hov = rect_contains(q_rect, mx, my);
-            help_btns.push((q_rect, idx));
-            out.push(Line::from(vec![
-                Span::styled(
-                    text,
-                    Style::default()
-                        .fg(Color::Rgb(178, 186, 200))
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    "[?]",
-                    if q_hov {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    },
-                ),
-            ]));
-        } else {
-            out.push(Line::from(Span::styled(text, Style::default().fg(base_color))));
-        }
-    };
-
-    for _ in 0..avail_above.saturating_sub(above_raw.len()) {
-        out.push(Line::from(""));
-    }
-    for (text, idx, t, color) in above_raw {
-        push_centered_dim(&mut out, &mut row_map, &mut help_btns, text, idx, t, color);
-    }
-
-    out.push(Line::from(""));
-    let active_t = app.lrc_lines[active_idx].time_sec;
-    for (ri, mut spans) in active_rows.into_iter().enumerate() {
-        let sy = lrc_area.y + 1 + out.len() as u16;
-        row_map.push((sy, active_idx, active_t));
-        if ri == 0 {
-            // Show subtle clickable `[?]` right beside the active lyric line too
-            let text_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let total_chars = text_chars + 4;
-            let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
-            let q_x = lrc_area.x + 1 + (left_pad + text_chars + 1) as u16;
-            let q_rect = Rect::new(q_x, sy, 3, 1);
-            let q_hov = mouse_in_lyrics && rect_contains(q_rect, mx, my);
-            help_btns.push((q_rect, active_idx));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                "[?]",
-                if q_hov {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
+        match raw {
+            RawRow::Blank => out.push(Line::from("")),
+            RawRow::Bar(bl) => out.push(bl),
+            RawRow::Plain { text, idx, t, color } => {
+                let hovered = mouse_in_lyrics && my == sy;
+                row_map.push((sy, idx, t));
+                if hovered {
+                    let total_chars = text.chars().count() + 4;
+                    let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
+                    let q_x = lrc_area.x + 1 + (left_pad + text.chars().count() + 1) as u16;
+                    let q_rect = Rect::new(q_x, sy, 3, 1);
+                    let q_hov = rect_contains(q_rect, mx, my);
+                    help_btns.push((q_rect, idx));
+                    out.push(Line::from(vec![
+                        Span::styled(
+                            text,
+                            Style::default()
+                                .fg(Color::Rgb(178, 186, 200))
+                                .add_modifier(Modifier::UNDERLINED),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            "[?]",
+                            if q_hov {
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::Yellow)
+                            },
+                        ),
+                    ]));
                 } else {
-                    Style::default().fg(Color::Rgb(120, 122, 130))
-                },
-            ));
+                    out.push(Line::from(Span::styled(text, Style::default().fg(color))));
+                }
+            }
+            RawRow::Active {
+                mut spans,
+                idx,
+                t,
+                show_help,
+            } => {
+                row_map.push((sy, idx, t));
+                if show_help {
+                    let text_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                    let total_chars = text_chars + 4;
+                    let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
+                    let q_x = lrc_area.x + 1 + (left_pad + text_chars + 1) as u16;
+                    let q_rect = Rect::new(q_x, sy, 3, 1);
+                    let q_hov = mouse_in_lyrics && rect_contains(q_rect, mx, my);
+                    help_btns.push((q_rect, idx));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        "[?]",
+                        if q_hov {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Rgb(120, 122, 130))
+                        },
+                    ));
+                }
+                out.push(Line::from(spans));
+            }
         }
-        out.push(Line::from(spans));
-    }
-    out.push(bar_line);
-    out.push(Line::from(""));
-
-    for (text, idx, t, color) in below_raw {
-        push_centered_dim(&mut out, &mut row_map, &mut help_btns, text, idx, t, color);
     }
 
     (out, row_map, help_btns)
@@ -3515,7 +3680,13 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 let pane_title = match &app.view {
                     View::AllTracks => format!(" All Tracks ({}) ", app.track_list.len()),
                     View::Liked => format!(" * Liked Songs ({}) ", app.track_list.len()),
-                    View::Queue => format!(" Queue ({}) ", app.track_list.len()),
+                    View::Queue => {
+                        let np = app
+                            .current_track_entry()
+                            .map(|e| format!(" | Now: {}", e.title))
+                            .unwrap_or_default();
+                        format!(" Up Next Queue ({}){} ", app.track_list.len(), np)
+                    }
                     View::Playlist(idx) => app
                         .lib
                         .playlists
@@ -3573,14 +3744,22 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         line2_spans.push(Span::raw(" "));
 
                         let is_cur = cur_playing.as_deref() == Some(fname.as_str());
-                        let status_tag = if is_cur {
-                            if is_paused { "|| " } else { ">  " }
+                        let is_queue_view = matches!(app.view, View::Queue);
+                        let is_manual_queued = is_queue_view && i < app.queue.len();
+                        let status_tag = if is_queue_view {
+                            format!("{:>2}.", i + 1)
+                        } else if is_cur {
+                            if is_paused { "|| ".into() } else { ">  ".into() }
                         } else if liked {
-                            "*  "
+                            "*  ".into()
                         } else {
-                            "   "
+                            "   ".into()
                         };
-                        let tag_style = if is_cur {
+                        let tag_style = if is_manual_queued {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else if is_queue_view {
+                            Style::default().fg(Color::Rgb(135, 140, 150))
+                        } else if is_cur {
                             Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD)
                         } else if liked {
                             Style::default().fg(Color::Yellow)
@@ -3593,6 +3772,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
                         }
                         line1_spans.push(Span::styled(status_tag, tag_style));
+                        if is_queue_view {
+                            line1_spans.push(Span::raw(" "));
+                        }
                         line1_spans.push(Span::styled(
                             t_disp,
                             if is_cur {
@@ -3601,6 +3783,12 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 Style::default().fg(Color::Rgb(244, 244, 246))
                             },
                         ));
+                        if is_manual_queued {
+                            line1_spans.push(Span::styled(
+                                " [QUEUED]",
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
 
                         let dur_s = if dur_sec > 0 {
                             fmt_time(dur_sec as f64)
@@ -3702,6 +3890,31 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             .title(lrc_title),
                     );
                 f.render_widget(lrc_widget, lrc_area);
+
+                // Floating [ Return ] button appears right after you scroll away from current lyrics!
+                if app.lyrics_scroll_offset != 0 && lrc_area.width >= 16 && lrc_area.height >= 5 {
+                    let bw = 12u16;
+                    let bx = lrc_area.x + (lrc_area.width.saturating_sub(bw)) / 2;
+                    let by = lrc_area.y + lrc_area.height.saturating_sub(2);
+                    let brect = Rect::new(bx, by, bw, 1);
+                    let hov = rect_contains(brect, app.mouse_pos.0, app.mouse_pos.1);
+                    f.render_widget(Clear, brect);
+                    let ret_btn = Paragraph::new(" [ Return ] ")
+                        .alignment(Alignment::Center)
+                        .style(if hov {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(118, 238, 148))
+                                .add_modifier(Modifier::BOLD)
+                        });
+                    app.hits.buttons.push((brect, ButtonAction::LyricsReturn));
+                    f.render_widget(ret_btn, brect);
+                }
             }
 
             // 3. Now Playing Progress Bar (high-contrast crisp white text!)
@@ -3801,6 +4014,15 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     "[ Artist ]".into(),
                     Style::default().fg(Color::Cyan),
                     Some(ButtonAction::OpenCurrentArtist),
+                ),
+                (
+                    "[ Queue ]".into(),
+                    if matches!(app.view, View::Queue) {
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    },
+                    Some(ButtonAction::OpenQueue),
                 ),
                 (
                     format!("[ Lrc: {} ]", if app.show_lyrics_pane { "on" } else { "off" }),
@@ -4211,6 +4433,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
                             KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
                             KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
+                            KeyCode::PageUp => app.scroll_lyrics(-3),
+                            KeyCode::PageDown => app.scroll_lyrics(3),
                             KeyCode::Right => app.player.seek_rel(5.0),
                             KeyCode::Left => app.player.seek_rel(-5.0),
                             KeyCode::Char(' ') => app.trigger_button(ButtonAction::PlayPause),
@@ -4298,11 +4522,11 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 } else if let Some(fname) = app.selected_track() {
                                     if matches!(app.view, View::Queue) {
                                         if let Some(i) = app.track_state.selected() {
-                                            app.queue.remove(i);
-                                            app.rebuild_track_list();
+                                            app.play_from_queue_index(i);
                                         }
+                                    } else {
+                                        app.play_filename(&fname, true);
                                     }
-                                    app.play_filename(&fname, true);
                                 }
                             }
                             KeyCode::Char('Q') => {
@@ -4314,7 +4538,10 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                         .get(&fname)
                                         .map(|e| e.title.clone())
                                         .unwrap_or(fname);
-                                    app.status = format!("Queued next: {t}");
+                                    if matches!(app.view, View::Queue) {
+                                        app.rebuild_track_list();
+                                    }
+                                    app.set_notice(format!("Queued next: {t}"));
                                 }
                             }
                             KeyCode::Char('N') => {
@@ -4358,6 +4585,19 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                             }
                                             app.status = format!("Unlinked Spotify playlist '{name}'");
                                         }
+                                    }
+                                } else if matches!(app.view, View::Queue) {
+                                    if let Some(sel) = app.track_state.selected() {
+                                        if sel < app.queue.len() {
+                                            app.queue.remove(sel);
+                                        } else {
+                                            let u_idx = sel - app.queue.len();
+                                            if u_idx < app.upcoming.len() {
+                                                app.upcoming.remove(u_idx);
+                                            }
+                                        }
+                                        app.rebuild_track_list();
+                                        app.set_notice("Removed from queue");
                                     }
                                 } else if let View::Playlist(idx) = app.view {
                                     if let Some(sel) = app.track_state.selected() {
