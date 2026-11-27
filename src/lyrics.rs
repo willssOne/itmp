@@ -19,8 +19,8 @@ pub struct LrcLine {
     pub words: Vec<LrcWord>,
 }
 
-/// Compact 20ms (50 Hz) vocal-band (300-1900 Hz) energy & onset envelope.
-/// ~40 KB per 3-minute track; strips 808 sub-bass and hi-hats to track vocals.
+/// Compact 15ms (~66.7 Hz) vocal-band (320-2600 Hz) energy & onset envelope.
+/// Strips 808 sub-bass and high-hat hiss while preserving vocal formants and consonant attacks.
 #[derive(Debug, Clone)]
 pub struct AudioEnvelope {
     pub frame_sec: f64,
@@ -39,9 +39,9 @@ impl AudioEnvelope {
                 "-ac",
                 "1",
                 "-ar",
-                "4000",
+                "8000",
                 "-af",
-                "highpass=f=300,lowpass=f=1900",
+                "highpass=f=320,lowpass=f=2600",
                 "-f",
                 "s16le",
                 "-",
@@ -51,15 +51,15 @@ impl AudioEnvelope {
             .output()
             .ok()?;
 
-        if !out.status.success() || out.stdout.len() < 320 {
+        if !out.status.success() || out.stdout.len() < 480 {
             return None;
         }
 
-        // 80 samples at 4000 Hz = 20ms per frame
-        const SAMPLES_PER_FRAME: usize = 80;
+        // 120 samples at 8000 Hz = 15ms per frame
+        const SAMPLES_PER_FRAME: usize = 120;
         const BYTES_PER_FRAME: usize = SAMPLES_PER_FRAME * 2;
         let frame_count = out.stdout.len() / BYTES_PER_FRAME;
-        if frame_count < 10 {
+        if frame_count < 12 {
             return None;
         }
 
@@ -76,13 +76,13 @@ impl AudioEnvelope {
             raw_rms.push((sum_sq / SAMPLES_PER_FRAME as f64).sqrt() as f32);
         }
 
-        // Light 3-frame smoothing so single-frame spikes don't jitter timing
+        // Light 3-frame smoothing to reduce single-frame clicks while preserving crisp syllable attacks
         let mut rms = Vec::with_capacity(frame_count);
         for i in 0..frame_count {
             let a = raw_rms[i.saturating_sub(1)];
             let b = raw_rms[i];
             let c = raw_rms[(i + 1).min(frame_count - 1)];
-            rms.push(0.25 * a + 0.50 * b + 0.25 * c);
+            rms.push(0.20 * a + 0.60 * b + 0.20 * c);
         }
 
         let mut onset = Vec::with_capacity(frame_count);
@@ -92,7 +92,7 @@ impl AudioEnvelope {
         }
 
         Some(Self {
-            frame_sec: 0.02,
+            frame_sec: 0.015,
             rms,
             onset,
         })
@@ -105,9 +105,22 @@ impl AudioEnvelope {
         ((t.max(0.0) / self.frame_sec).floor() as usize).min(self.rms.len() - 1)
     }
 
-    /// Detects the real active vocal interval inside `[t_start, t_end]`
-    /// and returns `(v_start, v_end, vocal_tail_end)`.
-    /// `vocal_tail_end` captures trailing adlib vocal energy past the main phrase.
+    /// Computes local background floor & peak inside `[i0..=i1]` so instrumental pads drop to 0
+    /// and true vocal syllables stand out sharply.
+    fn local_floor_and_peak(&self, i0: usize, i1: usize) -> (f32, f32) {
+        let slice = &self.rms[i0..=i1];
+        let mut sorted: Vec<f32> = slice.to_vec();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let floor = sorted[sorted.len() / 5];
+        let peak = sorted[(sorted.len() * 92) / 100].max(floor + 1e-4);
+        (floor, peak)
+    }
+
+    /// Detects the exact active vocal window inside `[t_start, t_end]`
+    /// returning `(v_start, v_end, vocal_tail_end)`:
+    /// - Trims LRC early-tap dead lead-in (up to +0.65s) until real vocal energy rises
+    /// - Strips trailing instrumental silence so short lines finish right with the artist
+    /// - Preserves `vocal_tail_end` to anchor trailing adlibs
     fn detect_vocal_bounds(
         &self,
         t_start: f64,
@@ -117,34 +130,35 @@ impl AudioEnvelope {
     ) -> (f64, f64, f64) {
         let i0 = self.time_to_idx(t_start);
         let i1 = self.time_to_idx((t_end - 0.03).max(t_start + 0.25));
-        if i1 <= i0 + 4 {
+        if i1 <= i0 + 5 {
             let ve = (t_start + nat_max).min(t_end - 0.04).max(t_start + 0.25);
             return (t_start, ve, ve);
         }
 
-        let slice = &self.rms[i0..=i1];
-        let mut sorted: Vec<f32> = slice.to_vec();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let floor = sorted[sorted.len() / 6];
-        let peak = sorted[(sorted.len() * 9) / 10].max(floor + 1e-4);
+        let (floor, peak) = self.local_floor_and_peak(i0, i1);
         let range = (peak - floor).max(1e-4);
-        let active_thresh = floor + 0.22 * range;
+        let slice = &self.rms[i0..=i1];
 
-        // Trim dead lead-in up to +0.28s if the LRC timestamp came slightly early
-        let max_lead_frames = ((0.28 / self.frame_sec) as usize).min(slice.len() / 4);
+        // 1. Lead-in trim: LRCLIB timestamps are frequently 0.15s-0.60s early.
+        //    Walk forward up to min(0.65s, 35% of bar) to find the true vocal attack.
+        let max_lead_sec = ((t_end - t_start) * 0.35).min(0.65);
+        let max_lead_frames = ((max_lead_sec / self.frame_sec) as usize).min(slice.len() / 2);
+        let lead_thresh = floor + 0.26 * range;
         let mut lead_off = 0usize;
         for (k, &v) in slice.iter().take(max_lead_frames).enumerate() {
-            if v >= active_thresh {
-                lead_off = k;
+            if v >= lead_thresh {
+                // Step back 1 frame (15ms) so consonant attack is included
+                lead_off = k.saturating_sub(1);
                 break;
             }
         }
         let v_start = t_start + (lead_off as f64) * self.frame_sec;
 
-        // Find last active vocal frame in the full line window (captures adlib echoes too)
+        // 2. Full vocal tail (captures trailing adlib echoes)
+        let tail_thresh = floor + 0.20 * range;
         let mut last_active_full = slice.len() - 1;
         for k in (lead_off..slice.len()).rev() {
-            if slice[k] >= floor + 0.18 * range {
+            if slice[k] >= tail_thresh {
                 last_active_full = k;
                 break;
             }
@@ -153,14 +167,15 @@ impl AudioEnvelope {
             .min(t_end - 0.03)
             .max(v_start + 0.25);
 
-        // Main vocal end: respect natural vocal rate cap so short bars don't crawl across beat pockets
+        // 3. Main vocal end: bounded by natural speaking pace + actual audio drop-off
         let cap_end = (v_start + nat_max).min(vocal_tail_end);
         let cap_rel = ((cap_end - t_start) / self.frame_sec)
             .floor()
             .clamp(lead_off as f64, (slice.len() - 1) as f64) as usize;
+        let main_thresh = floor + 0.24 * range;
         let mut last_main = cap_rel;
         for k in (lead_off..=cap_rel).rev() {
-            if slice[k] >= active_thresh {
+            if slice[k] >= main_thresh {
                 last_main = k;
                 break;
             }
@@ -175,8 +190,9 @@ impl AudioEnvelope {
         (v_start, v_end, vocal_tail_end.max(v_end))
     }
 
-    /// Builds a normalized cumulative vocal activity curve over `[start_t, end_t]`
-    /// so dense syllables move faster and breath pauses naturally slow down.
+    /// Builds a noise-floor-subtracted cumulative vocal activity CDF over `[start_t, end_t]`.
+    /// Quiet breath/comma pauses drop to ~0.08 activity (holding cleanly across real pauses),
+    /// while dense vocal syllables/consonants drive rapid word progression.
     fn build_cdf(&self, start_t: f64, end_t: f64) -> Option<(usize, Vec<f64>)> {
         let i0 = self.time_to_idx(start_t);
         let i1 = self.time_to_idx(end_t);
@@ -184,10 +200,11 @@ impl AudioEnvelope {
             return None;
         }
         let n = i1 - i0 + 1;
-        let mut max_rms = 1e-4f32;
+        let (floor, peak) = self.local_floor_and_peak(i0, i1);
+        let range = (peak - floor).max(1e-4);
+
         let mut max_ons = 1e-4f32;
         for i in i0..=i1 {
-            max_rms = max_rms.max(self.rms[i]);
             max_ons = max_ons.max(self.onset[i]);
         }
 
@@ -195,10 +212,10 @@ impl AudioEnvelope {
         cdf.push(0.0);
         let mut acc = 0.0f64;
         for i in i0..=i1 {
-            let nr = (self.rms[i] / max_rms) as f64;
+            let excess = ((self.rms[i] - floor) / range).clamp(0.0, 1.0) as f64;
             let no = (self.onset[i] / max_ons) as f64;
-            // 0.28 floor prevents stalling in brief dips while letting real vocal bursts drive pace
-            let act = 0.28 + 0.44 * nr + 0.28 * no;
+            // Low 0.08 floor lets real mid-bar pauses hold naturally without freezing
+            let act = 0.08 + 0.62 * excess.powf(1.35) + 0.30 * no;
             acc += act;
             cdf.push(acc);
         }
@@ -211,9 +228,15 @@ impl AudioEnvelope {
         Some((i0, cdf))
     }
 
-    /// Maps a normalized linguistic progress `u in [0, 1]` to a timestamp in `[start_t, end_t]`
-    /// blended 50/50 between uniform linguistic time and audio-envelope CDF time.
-    fn warp_time(&self, start_t: f64, end_t: f64, cdf_opt: Option<&(usize, Vec<f64>)>, u: f64) -> f64 {
+    /// Maps linguistic progress `u in [0, 1]` to a timestamp in `[start_t, end_t]`
+    /// driven 72% by real vocal-band audio energy/onsets and 28% by syllable pacing.
+    fn warp_time(
+        &self,
+        start_t: f64,
+        end_t: f64,
+        cdf_opt: Option<&(usize, Vec<f64>)>,
+        u: f64,
+    ) -> f64 {
         let u = u.clamp(0.0, 1.0);
         let lin = start_t + u * (end_t - start_t);
         let Some((i0, cdf)) = cdf_opt else {
@@ -223,7 +246,6 @@ impl AudioEnvelope {
         if n == 0 {
             return lin;
         }
-        // Binary search in CDF for `u`
         let pos = match cdf.binary_search_by(|v| v.total_cmp(&u)) {
             Ok(idx) => idx as f64,
             Err(idx) => {
@@ -241,7 +263,7 @@ impl AudioEnvelope {
         };
         let audio_t = ((*i0 as f64) + pos) * self.frame_sec;
         let audio_clamped = audio_t.clamp(start_t, end_t);
-        0.48 * lin + 0.52 * audio_clamped
+        0.28 * lin + 0.72 * audio_clamped
     }
 }
 
@@ -252,11 +274,9 @@ enum LineToken {
 }
 
 struct AdlibGroup {
-    /// Index into the main-word array immediately preceding this adlib (or None if before first main word)
     anchor_main_idx: Option<usize>,
-    /// True if no main words appear after this adlib group
     is_trailing: bool,
-    word_indices: Vec<usize>, // indices into the final line words Vec
+    word_indices: Vec<usize>,
 }
 
 fn count_syllables(word: &str) -> usize {
@@ -288,8 +308,6 @@ fn count_syllables(word: &str) -> usize {
     cnt.max(1)
 }
 
-/// Tokenizes a lyric line into main words and parenthesized adlib groups `(...)`,
-/// preserving exact visual order on the same line.
 fn split_main_and_adlibs(line_text: &str) -> Vec<LineToken> {
     let raw: Vec<&str> = line_text.split_whitespace().collect();
     let mut tokens = Vec::with_capacity(raw.len());
@@ -299,7 +317,11 @@ fn split_main_and_adlibs(line_text: &str) -> Vec<LineToken> {
 
     for w in &raw {
         let starts_p = w.starts_with('(');
-        let ends_p = w.ends_with(')') || w.ends_with("),") || w.ends_with(").") || w.ends_with(")?") || w.ends_with(")!");
+        let ends_p = w.ends_with(')')
+            || w.ends_with("),")
+            || w.ends_with(").")
+            || w.ends_with(")?")
+            || w.ends_with(")!");
         if starts_p && !in_paren {
             in_paren = true;
             tokens.push(LineToken::Adlib {
@@ -325,8 +347,6 @@ fn split_main_and_adlibs(line_text: &str) -> Vec<LineToken> {
         }
     }
 
-    // If the entire line is parenthesized (e.g. producer tag "(Swiz need to pipe down)"),
-    // treat it as main vocal so it highlights across the bar instead of having no anchor.
     if !has_main {
         return raw
             .into_iter()
@@ -347,11 +367,11 @@ fn word_weight_and_pause(w: &str, is_last: bool) -> (f64, f64, usize) {
     let pause = if is_last {
         0.0
     } else if w.ends_with(',') || w.ends_with(';') {
-        0.42
+        0.45
     } else if w.ends_with('.') || w.ends_with('!') || w.ends_with('?') {
-        0.58
+        0.60
     } else {
-        0.07
+        0.06
     };
     (wt, pause, syl)
 }
@@ -395,9 +415,9 @@ fn assign_sequence_timings(
             None => start_t + u1 * span,
         };
         ws = ws.max(prev_end);
-        we = we.max(ws + 0.08).min(start_t + span);
+        we = we.max(ws + 0.07).min(start_t + span);
         if we <= ws {
-            we = ws + 0.08;
+            we = ws + 0.07;
         }
         out.push((ws, we));
         prev_end = we;
@@ -405,7 +425,6 @@ fn assign_sequence_timings(
     out
 }
 
-/// Parses inline enhanced LRC word tags like `<00:12.34>word` if present.
 fn parse_enhanced_lrc_words(text: &str, t_end: f64) -> Option<Vec<LrcWord>> {
     if !text.contains('<') || !text.contains('>') {
         return None;
@@ -480,7 +499,7 @@ fn build_word_timings(
     }
 
     let mut main_texts: Vec<String> = Vec::new();
-    let mut main_word_slots: Vec<usize> = Vec::new(); // final index in `out`
+    let mut main_word_slots: Vec<usize> = Vec::new();
     let mut groups: Vec<AdlibGroup> = Vec::new();
     let mut group_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
 
@@ -531,8 +550,7 @@ fn build_word_timings(
         g.is_trailing = g.anchor_main_idx.map(|a| a + 1 >= total_main).unwrap_or(false);
     }
 
-    // 1. Estimate realistic natural duration bounds for the MAIN vocal ONLY
-    //    (Adlibs NEVER steal time from the main lyrics!)
+    // Natural speaking pace bounds for MAIN vocal only (adlibs never steal time)
     let main_syls: usize = main_texts.iter().map(|w| count_syllables(w)).sum();
     let main_pauses: f64 = main_texts
         .iter()
@@ -540,42 +558,43 @@ fn build_word_timings(
         .map(|(i, w)| word_weight_and_pause(w, i + 1 == total_main).1)
         .sum();
     let span = (t_end - t_start).clamp(0.30, 8.5);
-    // Natural rap/sung pace: ~0.12s/syl fast, ~0.34s/syl relaxed (prevents slow-mo stretching!)
-    let nat_min = ((main_syls as f64) * 0.12 + main_pauses * 0.12)
-        .clamp(0.30, (span * 0.85).max(0.30));
-    let nat_max = ((main_syls as f64) * 0.34 + main_pauses * 0.28 + 0.25)
+    let nat_min = ((main_syls as f64) * 0.11 + main_pauses * 0.12)
+        .clamp(0.28, (span * 0.85).max(0.28));
+    let nat_max = ((main_syls as f64) * 0.30 + main_pauses * 0.25 + 0.22)
         .clamp(nat_min + 0.15, (span * 0.94).max(nat_min + 0.15));
 
     let (v_start, v_end, vocal_tail_end) = match env {
         Some(e) => e.detect_vocal_bounds(t_start, t_start + span, nat_min, nat_max),
         None => {
-            let ve = (t_start + nat_max.min(span * 0.90)).max(t_start + nat_min);
-            (t_start, ve, (t_start + span * 0.94).max(ve))
+            // Without envelope yet, trim slight typical LRC early-tap (0.12s)
+            let vs = t_start + (span * 0.05).min(0.12);
+            let ve = (vs + nat_max.min(span * 0.86)).max(vs + nat_min);
+            (vs, ve, (t_start + span * 0.92).max(ve))
         }
     };
 
-    // 2. Time all MAIN words inside `[v_start, v_end]`
     let main_timings = assign_sequence_timings(&main_texts, v_start, v_end, env);
     for (&slot, &(ws, we)) in main_word_slots.iter().zip(main_timings.iter()) {
         out[slot].start = ws;
         out[slot].end = we;
     }
 
-    // 3. Time each ADLIB group IN PARALLEL on the SAME LINE so adlibs play simultaneously!
+    // Parallel same-line adlibs
     for g in &groups {
-        let adlib_texts: Vec<String> = g.word_indices.iter().map(|&idx| out[idx].text.clone()).collect();
+        let adlib_texts: Vec<String> = g
+            .word_indices
+            .iter()
+            .map(|&idx| out[idx].text.clone())
+            .collect();
         let adlib_syls: usize = adlib_texts.iter().map(|w| count_syllables(w)).sum();
         let adlib_pauses: f64 = adlib_texts
             .iter()
             .enumerate()
             .map(|(i, w)| word_weight_and_pause(w, i + 1 == adlib_texts.len()).1)
             .sum();
-        let nat_adlib_dur = ((adlib_syls as f64) * 0.22 + adlib_pauses * 0.18 + 0.16).clamp(0.32, 2.4);
+        let nat_adlib_dur = ((adlib_syls as f64) * 0.20 + adlib_pauses * 0.16 + 0.14).clamp(0.30, 2.2);
 
         let (a_start, a_end) = if g.is_trailing {
-            // Trailing adlib (e.g. "(pop out)", "(fuck that, pop out)", "(go, go)"):
-            // Overlaps the tail of the main vocal so BOTH light up at the same time on the same line,
-            // then rides cleanly into the vocal echo tail!
             let overlap_words = if adlib_texts.len() >= 3 { 3 } else { 2 };
             let overlap_idx = total_main.saturating_sub(overlap_words);
             let overlap_t = main_timings
@@ -584,12 +603,11 @@ fn build_word_timings(
                 .unwrap_or(v_start);
             let min_start = (v_start + (v_end - v_start) * 0.45).min(v_end - 0.15);
             let a_s = overlap_t.max(min_start).max(v_start);
-            let target_end = (a_s + nat_adlib_dur).max(vocal_tail_end.min(a_s + nat_adlib_dur * 1.35));
-            let a_e = target_end.min(t_start + span - 0.03).max(a_s + 0.28);
+            let target_end =
+                (a_s + nat_adlib_dur).max(vocal_tail_end.min(a_s + nat_adlib_dur * 1.30));
+            let a_e = target_end.min(t_start + span - 0.03).max(a_s + 0.26);
             (a_s, a_e)
         } else if let Some(anchor) = g.anchor_main_idx {
-            // Mid-line adlib (e.g. "I can't choose (can't choose), I can't decide..."):
-            // Starts right as the anchor phrase lands and runs IN PARALLEL with the next main words!
             let anchor_end = main_timings
                 .get(anchor)
                 .map(|&(_, e)| e)
@@ -597,12 +615,11 @@ fn build_word_timings(
             let a_s = (anchor_end - 0.06).max(v_start);
             let a_e = (a_s + nat_adlib_dur)
                 .min(t_start + span - 0.03)
-                .max(a_s + 0.28);
+                .max(a_s + 0.26);
             (a_s, a_e)
         } else {
-            // Leading adlib at the very start of a line
             let a_s = v_start;
-            let a_e = (a_s + nat_adlib_dur).min(v_end).max(a_s + 0.28);
+            let a_e = (a_s + nat_adlib_dur).min(v_end).max(a_s + 0.26);
             (a_s, a_e)
         };
 
@@ -629,7 +646,6 @@ pub fn load_lrc(dir: &Path, filename: &str, env: Option<&AudioEnvelope>) -> Vec<
         if !s.starts_with('[') {
             continue;
         }
-        // Support multiple timestamps on one line like [00:12.00][01:02.00]Chorus
         let mut cursor = s;
         let mut timestamps = Vec::new();
         while cursor.starts_with('[') {
@@ -663,6 +679,11 @@ pub fn load_lrc(dir: &Path, filename: &str, env: Option<&AudioEnvelope>) -> Vec<
             t_start + 3.5
         };
         let words = build_word_timings(text, t_start, t_end, env);
+        // Set line activation time slightly before first detected vocal word so the bar switches right on cue
+        let line_start = words
+            .first()
+            .map(|w| (w.start - 0.08).max(t_start))
+            .unwrap_or(t_start);
         let clean_text = if text.contains('<') && text.contains('>') {
             words
                 .iter()
@@ -673,7 +694,7 @@ pub fn load_lrc(dir: &Path, filename: &str, env: Option<&AudioEnvelope>) -> Vec<
             text.clone()
         };
         out.push(LrcLine {
-            time_sec: t_start,
+            time_sec: line_start,
             text: clean_text,
             words,
         });
@@ -695,7 +716,6 @@ mod tests {
         );
         let last_main = trailing.iter().filter(|w| !w.is_adlib).last().unwrap();
         let first_adlib = trailing.iter().find(|w| w.is_adlib).unwrap();
-        // Adlib starts BEFORE the main vocal finishes so both play at the same time on the same line!
         assert!(
             first_adlib.start < last_main.end,
             "trailing adlib should overlap main vocal: adlib_start={} main_end={}",
@@ -713,7 +733,8 @@ mod tests {
         let after_choose = midline.iter().find(|w| w.text == "I" && w.start > 46.0).unwrap();
         assert!(!adlib_words.is_empty());
         assert!(
-            adlib_words[0].start < after_choose.end && adlib_words.last().unwrap().end > after_choose.start,
+            adlib_words[0].start < after_choose.end
+                && adlib_words.last().unwrap().end > after_choose.start,
             "mid-line adlib should play simultaneously with following main words"
         );
     }
@@ -722,12 +743,10 @@ mod tests {
     fn short_line_does_not_crawl_across_long_beat_gap() {
         let words = build_word_timings("Pull up, who that is? (Errt, errt)", 41.22, 44.73, None);
         let main_end = words.iter().filter(|w| !w.is_adlib).last().unwrap().end;
-        // Main vocal (5 syllables) should finish naturally well before the 3.51s beat gap ends
         assert!(
-            main_end - 41.22 < 2.6,
+            main_end - 41.22 < 2.5,
             "short line stretched too slow: dur={:.2}s",
             main_end - 41.22
         );
     }
 }
-

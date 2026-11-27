@@ -843,15 +843,15 @@ impl App {
             }
         }
 
-        if self.last_pb_poll.elapsed() < Duration::from_millis(75) {
+        if self.last_pb_poll.elapsed() < Duration::from_millis(50) {
             return;
         }
         self.last_pb_poll = now;
         self.pb = self.player.poll_state();
-        if !self.pb.active || self.pb.paused || (self.smooth_pos - self.pb.pos).abs() > 0.10 {
+        if !self.pb.active || self.pb.paused || (self.smooth_pos - self.pb.pos).abs() > 0.06 {
             self.smooth_pos = self.pb.pos;
         } else {
-            self.smooth_pos = self.smooth_pos * 0.65 + self.pb.pos * 0.35;
+            self.smooth_pos = self.smooth_pos * 0.50 + self.pb.pos * 0.50;
         }
         if let Some(cur) = self.player.current_file.clone() {
             if self.pb.dur > 1.0 {
@@ -2059,21 +2059,47 @@ fn render_inline_buttons(
     Line::from(spans)
 }
 
-/// Word-by-word synced lyrics with simultaneous same-line adlibs (Green main, Yellow adlibs)
+fn wrap_plain_text(text: &str, max_w: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut cur = String::new();
+    for w in text.split_whitespace() {
+        let wlen = w.chars().count();
+        let clen = cur.chars().count();
+        if !cur.is_empty() && clen + 1 + wlen > max_w {
+            rows.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
+}
+
+/// Clean, vertically-centered truecolor word-by-word synced lyrics:
+/// - ONLY the active line is bright (lines above & below stay strictly dimmed)
+/// - Blank breathing space + live progress hairline frame the active bar
+/// - Main vocal sweeps in mint-green -> bright white; parallel adlibs sweep in gold at the same time
 fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
     let h = area_h.saturating_sub(2) as usize;
     let inner_w = area_w.saturating_sub(4).max(16) as usize;
 
     if app.lrc_lines.is_empty() {
-        lines.push(Line::from(""));
+        let pad = h / 2;
+        let mut lines: Vec<Line<'static>> = (0..pad).map(|_| Line::from("")).collect();
         lines.push(Line::from(Span::styled(
             if app.player.current_file.is_some() {
                 "No synced lyrics for this track"
             } else {
                 "Play a track to see live lyrics"
             },
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Rgb(84, 84, 92)),
         )));
         return lines;
     }
@@ -2082,93 +2108,179 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
         .current_track_entry()
         .map(|e| e.lrc_offset_ms as f64 / 1000.0)
         .unwrap_or(0.0);
-    let pos = app.smooth_pos + 0.04 + offset_sec;
-    let active_idx = app
-        .lrc_lines
-        .iter()
-        .rposition(|l| l.time_sec <= pos)
-        .unwrap_or(0);
+    let pos = app.smooth_pos + offset_sec;
 
-    let above = (h / 3).max(1);
-    let start = active_idx.saturating_sub(above);
-    let end = (start + h).min(app.lrc_lines.len());
+    let active_opt = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos);
+    let Some(active_idx) = active_opt else {
+        // Intro before first lyric line: show dim upcoming preview centered
+        let mut out = Vec::new();
+        let pad = h.saturating_sub(4) / 2;
+        for _ in 0..pad {
+            out.push(Line::from(""));
+        }
+        out.push(Line::from(Span::styled(
+            "...",
+            Style::default().fg(Color::Rgb(95, 95, 102)),
+        )));
+        out.push(Line::from(""));
+        for l in app.lrc_lines.iter().take(3) {
+            for r in wrap_plain_text(&l.text, inner_w) {
+                out.push(Line::from(Span::styled(
+                    r,
+                    Style::default().fg(Color::Rgb(68, 68, 76)),
+                )));
+            }
+        }
+        return out;
+    };
 
-    for i in start..end {
-        let entry = &app.lrc_lines[i];
-        if i != active_idx {
-            let color = if i + 1 == active_idx || i == active_idx + 1 {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            };
-            lines.push(Line::from(Span::styled(
-                entry.text.clone(),
-                Style::default().fg(color),
-            )));
-            continue;
+    // Build active bar lines (word-by-word + simultaneous adlibs)
+    let active_entry = &app.lrc_lines[active_idx];
+    let mut active_rows: Vec<Line<'static>> = Vec::new();
+    let mut current_row: Vec<Span<'static>> = Vec::new();
+    let mut row_len = 0usize;
+
+    let mut bar_start = f64::MAX;
+    let mut bar_end = 0.0f64;
+
+    for (wi, w) in active_entry.words.iter().enumerate() {
+        bar_start = bar_start.min(w.start);
+        bar_end = bar_end.max(w.end);
+
+        let w_chars: Vec<char> = w.text.chars().collect();
+        let w_len = w_chars.len();
+        let need_space = if current_row.is_empty() { 0 } else { 1 };
+        if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
+            active_rows.push(Line::from(std::mem::take(&mut current_row)));
+            row_len = 0;
+        }
+        if !current_row.is_empty() {
+            current_row.push(Span::raw(" "));
+            row_len += 1;
         }
 
-        let mut current_row: Vec<Span<'static>> = Vec::new();
-        let mut row_len = 0usize;
-
-        for (wi, w) in entry.words.iter().enumerate() {
-            let w_chars: Vec<char> = w.text.chars().collect();
-            let w_len = w_chars.len();
-            let need_space = if current_row.is_empty() { 0 } else { 1 };
-            if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
-                lines.push(Line::from(std::mem::take(&mut current_row)));
-                row_len = 0;
-            }
-            if !current_row.is_empty() {
-                current_row.push(Span::raw(" "));
-                row_len += 1;
-            }
-
-            let dur = (w.end - w.start).max(0.08);
-            let active_color = if w.is_adlib { Color::Yellow } else { Color::Green };
-            let sung_style = if w.is_adlib {
-                Style::default().fg(Color::Yellow)
-            } else {
+        let dur = (w.end - w.start).max(0.07);
+        let (active_fg, unlit_active_fg, sung_style, upcoming_fg) = if w.is_adlib {
+            (
+                Color::Rgb(242, 202, 92),  // warm gold sweeping adlib
+                Color::Rgb(138, 122, 82),  // unswept half of active adlib
+                Style::default().fg(Color::Rgb(192, 166, 98)),
+                Color::Rgb(84, 84, 92),    // dim upcoming adlib
+            )
+        } else {
+            (
+                Color::Rgb(118, 238, 148), // crisp mint-green sweeping main word
+                Color::Rgb(132, 136, 144), // unswept half stays dim (never jumps to white!)
                 Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
-            };
+                    .fg(Color::Rgb(244, 244, 246))
+                    .add_modifier(Modifier::BOLD),
+                Color::Rgb(96, 98, 106),   // clearly muted upcoming main word
+            )
+        };
 
-            if pos >= w.end {
-                current_row.push(Span::styled(w.text.clone(), sung_style));
-            } else if pos >= w.start - 0.02 {
-                let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
-                let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
-                let lit: String = w_chars[..split_at].iter().collect();
-                let rest: String = w_chars[split_at..].iter().collect();
-                current_row.push(Span::styled(
-                    lit,
-                    Style::default()
-                        .fg(active_color)
-                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-                ));
-                if !rest.is_empty() {
-                    current_row.push(Span::styled(
-                        rest,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-            } else {
-                current_row.push(Span::styled(
-                    w.text.clone(),
-                    Style::default().fg(Color::DarkGray),
-                ));
+        if pos >= w.end {
+            current_row.push(Span::styled(w.text.clone(), sung_style));
+        } else if pos >= w.start {
+            let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
+            let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
+            let lit: String = w_chars[..split_at].iter().collect();
+            let rest: String = w_chars[split_at..].iter().collect();
+            current_row.push(Span::styled(
+                lit,
+                Style::default().fg(active_fg).add_modifier(Modifier::BOLD),
+            ));
+            if !rest.is_empty() {
+                current_row.push(Span::styled(rest, Style::default().fg(unlit_active_fg)));
             }
-            row_len += w_len;
+        } else {
+            current_row.push(Span::styled(w.text.clone(), Style::default().fg(upcoming_fg)));
+        }
+        row_len += w_len;
 
-            if wi + 1 == entry.words.len() && !current_row.is_empty() {
-                lines.push(Line::from(std::mem::take(&mut current_row)));
-            }
+        if wi + 1 == active_entry.words.len() && !current_row.is_empty() {
+            active_rows.push(Line::from(std::mem::take(&mut current_row)));
         }
     }
-    lines
+
+    // Subtle live progress hairline directly under the active lyric bar
+    let bar_w = inner_w.min(26).max(8);
+    let bar_frac = if bar_end > bar_start {
+        ((pos - bar_start) / (bar_end - bar_start)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let filled = ((bar_w as f64) * bar_frac).round() as usize;
+    let bar_line = Line::from(vec![
+        Span::styled(
+            "─".repeat(filled),
+            Style::default().fg(Color::Rgb(118, 238, 148)),
+        ),
+        Span::styled(
+            "─".repeat(bar_w.saturating_sub(filled)),
+            Style::default().fg(Color::Rgb(46, 48, 54)),
+        ),
+    ]);
+
+    // Total active block height: 1 blank above + active_rows + progress hairline + 1 blank below
+    let active_block_h = 1 + active_rows.len() + 1 + 1;
+    let avail_above = h.saturating_sub(active_block_h) / 2;
+    let avail_below = h.saturating_sub(active_block_h + avail_above);
+
+    // Collect strictly-dimmed lines ABOVE active_idx (walking backwards)
+    let mut above_lines: Vec<Line<'static>> = Vec::new();
+    for back in 1..=active_idx {
+        if above_lines.len() >= avail_above {
+            break;
+        }
+        let idx = active_idx - back;
+        // All non-active lines stay strictly dimmed (subtle distance fade, never bright!)
+        let color = if back == 1 {
+            Color::Rgb(82, 82, 90)
+        } else {
+            Color::Rgb(54, 54, 60)
+        };
+        let wrapped = wrap_plain_text(&app.lrc_lines[idx].text, inner_w);
+        for row in wrapped.into_iter().rev() {
+            if above_lines.len() >= avail_above {
+                break;
+            }
+            above_lines.push(Line::from(Span::styled(row, Style::default().fg(color))));
+        }
+    }
+    above_lines.reverse();
+
+    // Collect strictly-dimmed lines BELOW active_idx
+    let mut below_lines: Vec<Line<'static>> = Vec::new();
+    for fwd in 1.. {
+        let idx = active_idx + fwd;
+        if idx >= app.lrc_lines.len() || below_lines.len() >= avail_below {
+            break;
+        }
+        let color = if fwd == 1 {
+            Color::Rgb(82, 82, 90)
+        } else {
+            Color::Rgb(54, 54, 60)
+        };
+        for row in wrap_plain_text(&app.lrc_lines[idx].text, inner_w) {
+            if below_lines.len() >= avail_below {
+                break;
+            }
+            below_lines.push(Line::from(Span::styled(row, Style::default().fg(color))));
+        }
+    }
+
+    let mut out = Vec::with_capacity(h);
+    // Top padding so active bar stays vertically centered even on line 0/1
+    for _ in 0..avail_above.saturating_sub(above_lines.len()) {
+        out.push(Line::from(""));
+    }
+    out.extend(above_lines);
+    out.push(Line::from(""));
+    out.extend(active_rows);
+    out.push(bar_line);
+    out.push(Line::from(""));
+    out.extend(below_lines);
+    out
 }
 
 fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
@@ -3064,7 +3176,6 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 let lrc_lines = render_word_synced_lyrics(&app, lrc_area.width, lrc_area.height);
                 let lrc_widget = Paragraph::new(lrc_lines)
                     .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: true })
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
@@ -3221,7 +3332,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
             f.render_widget(bottom, outer[4]);
         })?;
 
-        if event::poll(Duration::from_millis(45))? {
+        let poll_ms = if app.pb.active && !app.pb.paused { 16 } else { 45 };
+        if event::poll(Duration::from_millis(poll_ms))? {
             match event::read()? {
                 Event::Mouse(me) => app.handle_mouse(me.kind, me.column, me.row),
                 Event::Key(key) => {

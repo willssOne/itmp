@@ -171,7 +171,7 @@ impl MpvPlayer {
         let batch = concat!(
             "{\"command\":[\"get_property\",\"idle-active\"],\"request_id\":1}\n",
             "{\"command\":[\"get_property\",\"pause\"],\"request_id\":2}\n",
-            "{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":3}\n",
+            "{\"command\":[\"get_property\",\"playback-time\"],\"request_id\":3}\n",
             "{\"command\":[\"get_property\",\"duration\"],\"request_id\":4}\n"
         );
         if stream.write_all(batch.as_bytes()).is_err() {
