@@ -1,22 +1,29 @@
+mod art;
 mod artist;
 mod cache;
-mod cover;
+mod censor;
 mod downloader;
 mod genius;
 mod lyrics;
+mod names;
 mod player;
+mod repair;
 mod spotify;
+mod sync;
+mod tempo;
+mod theme;
+mod ui;
 
 use artist::{
     fetch_album_detail, fetch_artist_profile, find_and_fetch_album_by_name,
     parse_spotify_artist_id, search_albums, AlbumDetail, AlbumSummary, ArtistProfile,
 };
 use cache::{
-    add_track_to_playlist, audio_dir, clean_artist_name, find_cached_track, fmt_mb, fmt_time,
-    has_lrc, load_and_sync_library, now_ts, prune_lru, remove_track_files, save_library,
-    total_cache_bytes, Library, LikedArtist, Playlist, TrackEntry, DEFAULT_MAX_MB,
+    add_track_to_playlist, audio_dir, clean_artist_name, edit_library, fmt_mb, fmt_time, has_lrc,
+    load_and_sync_library, now_ts, prune_lru, remove_track_files, total_cache_bytes, Library,
+    LikedArtist, Playlist, TrackEntry, DEFAULT_MAX_MB,
 };
-use cover::{decode_thumb, fetch_remote_image_to_temp, CoverArt, ThumbCache, ThumbRows};
+use art::{fetch_remote_image_to_temp, Art};
 use downloader::{
     download_and_cache_track, expand_local_path, fetch_spotify_metadata, import_local_music,
     parse_spotify_export_file, search_youtube, SearchResult, SpotifyTrackSpec,
@@ -44,11 +51,11 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs, io,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
@@ -142,9 +149,13 @@ enum WorkerMsg {
     Progress(String),
     SearchDone(Result<Vec<SearchResult>, String>),
     SearchAlbumsDone(Result<Vec<AlbumSummary>, String>),
-    ThumbReady(String, ThumbRows),
-    DownloadDone(Result<(String, String), String>, bool), // (filename, msg), auto_play
+    ThumbReady(String, PathBuf),
+    DownloadDone(Box<Job>, Result<(String, String), String>), // (filename, msg)
     ImportDone(Result<String, String>),
+    Jobs(String, Vec<Job>),
+    Repaired(usize),
+    Synced(String, Result<(u64, u64), String>),
+    LyricsFetched(String, bool),
     LyricsAligned(String, Vec<LrcLine>),
     SpotifyLoginDone(Result<SpotifySession, String>),
     SpotifyCollectionsDone(Result<Vec<SpotifyCollection>, String>),
@@ -153,6 +164,71 @@ enum WorkerMsg {
     ArtistLoaded(Result<(ArtistProfile, Option<PathBuf>), String>),
     AlbumLoaded(Result<(AlbumDetail, Option<PathBuf>), String>),
     GeniusLoaded(String, String, Result<GeniusSongAnnotations, String>), // (song_key, lyric_line, res)
+}
+
+/// One song waiting to be downloaded.
+#[derive(Debug, Clone, Default)]
+struct Job {
+    id: u64,
+    /// A watch URL, or `ytsearch1:...` to let the downloader pick the best upload.
+    source: String,
+    title: String,
+    artist: String,
+    album: String,
+    cover: Option<String>,
+    duration_sec: u64,
+    playlist: Option<String>,
+    liked: bool,
+    play: bool,
+}
+
+impl Job {
+    fn from_spec(tr: &SpotifyTrackSpec, cover: Option<&str>) -> Self {
+        Job {
+            source: "ytsearch1:".into(),
+            title: tr.title.clone(),
+            artist: tr.artist.clone(),
+            album: tr.album.clone(),
+            cover: tr.cover_url.clone().or_else(|| cover.map(str::to_string)),
+            duration_sec: tr.duration_sec,
+            ..Job::default()
+        }
+    }
+
+    fn from_upload(item: &SearchResult) -> Self {
+        let (title, artist) = item.song_name();
+        Job {
+            source: format!("https://www.youtube.com/watch?v={}", item.id),
+            title,
+            artist,
+            // The search thumbnail is tiny; the download supplies a large one.
+            cover: None,
+            duration_sec: item.seconds(),
+            ..Job::default()
+        }
+    }
+
+    fn label(&self) -> String {
+        if self.artist.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{} — {}", self.title, self.artist)
+        }
+    }
+
+    fn run(&self, dir: &std::path::Path, max_bytes: u64) -> Result<(String, String), String> {
+        download_and_cache_track(
+            dir,
+            &self.source,
+            &self.title,
+            &self.artist,
+            &self.album,
+            self.cover.as_deref(),
+            self.duration_sec,
+            self.playlist.as_deref(),
+            max_bytes,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +258,12 @@ enum ButtonAction {
     SpotifyRefresh,
     SpotifyLogout,
     ToggleLikeArtist,
+    ToggleCensor,
+    CensorStyle,
+    Speed(bool),
+    Pitch(bool),
+    ToggleTuneLink,
+    ResetTune,
     ArtistImportAll,
     ArtistTab(ArtistTab),
     SearchTab(SearchTab),
@@ -221,6 +303,7 @@ struct HitAreas {
     dl_play_rows: Vec<(Rect, String)>,         // (row rect, filename)
     dl_del_btns: Vec<(Rect, String)>,          // ([x] delete rect, filename)
     popup_rect: Rect,
+    modal: Rect,
 }
 
 struct App {
@@ -233,6 +316,23 @@ struct App {
     last_frame: Instant,
     last_pb_poll: Instant,
     was_playing_file: bool,
+    loaded_at: Instant,
+    seen_active: bool,
+
+    theme: theme::Theme,
+    theme_stamp: Option<std::time::SystemTime>,
+    theme_checked: Instant,
+
+    jobs: VecDeque<Job>,
+    active_job: Option<Job>,
+    next_job_id: u64,
+    /// The download that should start playing when it lands (the latest click wins).
+    play_when_ready: Option<u64>,
+
+    aligner: sync::Aligner,
+    /// Title key -> (artist, seconds) of everything downloaded, for "saved" marks.
+    saved: HashMap<String, Vec<(String, u64)>>,
+    saved_ids: HashSet<String>,
 
     focus: Focus,
     sidebar_state: ListState,
@@ -252,9 +352,10 @@ struct App {
     lrc_lines: Vec<LrcLine>,
     lrc_file: Option<String>,
     lyrics_scroll_offset: isize,
-    cover_art: Option<CoverArt>,
-    cover_size: (u16, u16),
-    thumbs: ThumbCache,
+    art: Art,
+    /// Downloaded search / artist / album thumbnails by lookup key.
+    thumbs: HashMap<String, PathBuf>,
+    censor: censor::Censor,
 
     input_mode: InputMode,
     input_buf: String,
@@ -278,8 +379,6 @@ struct App {
     artist_profile: Option<ArtistProfile>,
     artist_loading_name: Option<String>,
     artist_avatar_path: Option<PathBuf>,
-    artist_avatar_art: Option<CoverArt>,
-    artist_avatar_size: (u16, u16),
     artist_tab: ArtistTab,
     artist_track_state: ListState,
     artist_album_state: ListState,
@@ -288,8 +387,6 @@ struct App {
     album_detail: Option<AlbumDetail>,
     album_loading_name: Option<String>,
     album_cover_path: Option<PathBuf>,
-    album_cover_art: Option<CoverArt>,
-    album_cover_size: (u16, u16),
     album_track_state: ListState,
     album_return_view: View,
 
@@ -327,6 +424,19 @@ impl App {
             initial_sp_state.select(Some(0));
         }
         let now = Instant::now();
+        let aligner = {
+            let tx = tx.clone();
+            sync::Aligner::start(dir.clone(), move |file, res| {
+                let _ = tx.send(WorkerMsg::Synced(file, res));
+            })
+        };
+        {
+            let dir = dir.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send(WorkerMsg::Repaired(repair::repair_library(&dir)));
+            });
+        }
         let mut app = Self {
             dir,
             max_bytes: max_mb * 1_048_576,
@@ -337,6 +447,18 @@ impl App {
             last_frame: now,
             last_pb_poll: now - Duration::from_secs(1),
             was_playing_file: false,
+            loaded_at: now,
+            seen_active: false,
+            theme: theme::Theme::load(),
+            theme_stamp: theme::Theme::stamp(),
+            theme_checked: now,
+            jobs: VecDeque::new(),
+            active_job: None,
+            next_job_id: 0,
+            play_when_ready: None,
+            aligner,
+            saved: HashMap::new(),
+            saved_ids: HashSet::new(),
             focus: Focus::Main,
             sidebar_state,
             view: View::AllTracks,
@@ -353,9 +475,9 @@ impl App {
             lrc_lines: Vec::new(),
             lrc_file: None,
             lyrics_scroll_offset: 0,
-            cover_art: None,
-            cover_size: (0, 0),
-            thumbs: ThumbCache::default(),
+            art: Art::default(),
+            thumbs: HashMap::new(),
+            censor: censor::Censor::load(),
             input_mode: InputMode::Normal,
             input_buf: String::new(),
             last_search_query: String::new(),
@@ -374,16 +496,12 @@ impl App {
             artist_profile: None,
             artist_loading_name: None,
             artist_avatar_path: None,
-            artist_avatar_art: None,
-            artist_avatar_size: (0, 0),
             artist_tab: ArtistTab::TopTracks,
             artist_track_state: ListState::default(),
             artist_album_state: ListState::default(),
             album_detail: None,
             album_loading_name: None,
             album_cover_path: None,
-            album_cover_art: None,
-            album_cover_size: (0, 0),
             album_track_state: ListState::default(),
             album_return_view: View::AllTracks,
             hits: HitAreas::default(),
@@ -398,10 +516,162 @@ impl App {
             tx,
             rx,
         };
+        app.lib.tune = app.lib.tune.sanitized();
+        app.player.set_tune(app.lib.tune);
+        app.index_saved();
         app.rebuild_track_list();
         app.play_context = app.track_list.clone();
         app.rebuild_upcoming(None);
         app
+    }
+
+    fn index_saved(&mut self) {
+        self.saved.clear();
+        self.saved_ids.clear();
+        for e in self.lib.entries.values() {
+            self.saved
+                .entry(names::title_key(&e.title, &e.artist))
+                .or_default()
+                .push((e.artist.clone(), e.duration_sec));
+            self.saved_ids.extend(e.source_id.clone());
+        }
+    }
+
+    /// Same rule as `find_cached_track`, but cheap enough to run every frame.
+    fn is_saved(&self, title: &str, artist: &str, secs: u64) -> bool {
+        self.saved
+            .get(&names::title_key(title, artist))
+            .map(|found| {
+                found.iter().any(|(a, d)| {
+                    (artist.trim().is_empty() || names::same_artist(a, artist))
+                        && (secs == 0 || *d == 0 || secs.abs_diff(*d) <= 20)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn find_saved(&self, job: &Job) -> Option<String> {
+        let id = job.source.split_once("watch?v=").map(|(_, id)| id);
+        cache::find_cached_track(&self.lib, &job.title, &job.artist, job.duration_sec, id)
+    }
+
+    /// Applies a change to the on-disk library and adopts the result.
+    fn edit<R>(&mut self, change: impl FnOnce(&mut Library) -> R) -> R {
+        let (lib, out) = edit_library(&self.dir, change);
+        self.lib = lib;
+        self.index_saved();
+        out
+    }
+
+    /// Plays a song if we have it, otherwise queues its download.
+    fn request_track(&mut self, mut job: Job) {
+        if let Some(file) = self.find_saved(&job) {
+            if job.playlist.is_some() || job.liked {
+                self.edit(|lib| {
+                    if let Some(name) = &job.playlist {
+                        add_track_to_playlist(lib, name, &file);
+                    }
+                    if let Some(e) = lib.entries.get_mut(&file) {
+                        e.liked |= job.liked;
+                    }
+                });
+                self.rebuild_track_list();
+            }
+            if job.play {
+                self.play_filename(&file, true);
+            } else {
+                self.set_notice(format!("'{}' is already downloaded", job.title));
+            }
+            return;
+        }
+        self.next_job_id += 1;
+        job.id = self.next_job_id;
+        if job.play {
+            self.play_when_ready = Some(job.id);
+        }
+        if let Some(active) = self.active_job.as_ref() {
+            if active.source == job.source && active.label() == job.label() {
+                if job.play {
+                    self.play_when_ready = Some(active.id);
+                }
+                return;
+            }
+        }
+        let same = |j: &Job| j.source == job.source && j.label() == job.label();
+        if let Some(old) = self.jobs.iter().position(same).and_then(|i| self.jobs.remove(i)) {
+            job.playlist = job.playlist.or(old.playlist);
+            job.liked |= old.liked;
+        }
+        let waiting = self.active_job.is_some();
+        let label = job.label();
+        if job.play {
+            self.jobs.push_front(job);
+        } else {
+            self.jobs.push_back(job);
+        }
+        if waiting {
+            self.set_notice(format!("Queued download: {label}"));
+        }
+        self.start_next_job();
+    }
+
+    fn start_next_job(&mut self) {
+        if self.active_job.is_some() {
+            return;
+        }
+        let Some(job) = self.jobs.pop_front() else {
+            return;
+        };
+        let left = self.jobs.len();
+        self.set_notice(format!(
+            "Downloading {}{}",
+            job.label(),
+            if left > 0 { format!("  (+{left} queued)") } else { String::new() }
+        ));
+        self.active_job = Some(job.clone());
+        let dir = self.dir.clone();
+        let max_bytes = self.max_bytes;
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let res = job.run(&dir, max_bytes);
+            let _ = tx.send(WorkerMsg::DownloadDone(Box::new(job), res));
+        });
+    }
+
+    fn lyric_position(&self) -> f64 {
+        let nudge = self
+            .current_track_entry()
+            .map(|e| e.lrc_offset_ms as f64 / 1000.0)
+            .unwrap_or(0.0);
+        self.smooth_pos + nudge
+    }
+
+    /// Throws away this song's lyrics and timing and fetches them again.
+    fn resync_lyrics(&mut self) {
+        let Some(e) = self.current_track_entry().cloned() else {
+            return;
+        };
+        let dir = self.dir.clone();
+        let tx = self.tx.clone();
+        self.set_notice(format!("Re-syncing lyrics for '{}'...", e.title));
+        self.lrc_lines.clear();
+        thread::spawn(move || {
+            let words = sync::words_path(&dir, &e.filename);
+            let _ = fs::remove_file(&words);
+            let lrc = words.with_extension("").with_extension("lrc");
+            let backup = lrc.with_extension("lrc.bak");
+            let had = fs::rename(&lrc, &backup).is_ok();
+            let stem = e.filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(&e.filename);
+            let found = downloader::fetch_synced_lrc(&dir, stem, &e.title, &e.artist, e.duration_sec);
+            if had {
+                if found {
+                    let _ = fs::remove_file(&backup);
+                } else {
+                    let _ = fs::rename(&backup, &lrc);
+                }
+            }
+            let _ = tx.send(WorkerMsg::LyricsFetched(e.filename, found || had));
+        });
     }
 
     fn next_rand(&mut self, bound: usize) -> usize {
@@ -424,7 +694,7 @@ impl App {
                 SidebarEntry::AllTracks,
             ),
             (
-                format!("* Liked Songs ({})", liked_count),
+                format!("Liked Songs ({})", liked_count),
                 SidebarEntry::Liked,
             ),
             (
@@ -433,23 +703,23 @@ impl App {
             ),
         ];
 
-        rows.push(("-- Artists --".to_string(), SidebarEntry::Header));
+        rows.push(("ARTISTS".to_string(), SidebarEntry::Header));
         if self.lib.liked_artists.is_empty() {
-            rows.push(("  (none liked)".to_string(), SidebarEntry::Header));
+            rows.push(("  none followed".to_string(), SidebarEntry::Header));
         } else {
             for (idx, ar) in self.lib.liked_artists.iter().enumerate() {
-                rows.push((format!("* {}", ar.name), SidebarEntry::Artist(idx)));
+                rows.push((format!("  {}", ar.name), SidebarEntry::Artist(idx)));
             }
         }
 
-        rows.push(("-- Playlists --".to_string(), SidebarEntry::Header));
+        rows.push(("PLAYLISTS".to_string(), SidebarEntry::Header));
         for (idx, pl) in self.lib.playlists.iter().enumerate() {
             rows.push((
-                format!("- {} ({})", pl.name, pl.tracks.len()),
+                format!("  {} ({})", pl.name, pl.tracks.len()),
                 SidebarEntry::Playlist(idx),
             ));
         }
-        rows.push(("+ New Playlist".to_string(), SidebarEntry::NewPlaylist));
+        rows.push(("+ New playlist".to_string(), SidebarEntry::NewPlaylist));
         rows
     }
 
@@ -542,6 +812,7 @@ impl App {
 
     fn reload_library(&mut self) {
         self.lib = load_and_sync_library(&self.dir);
+        self.index_saved();
         if let View::Playlist(idx) = self.view {
             if idx >= self.lib.playlists.len() {
                 self.view = View::AllTracks;
@@ -635,6 +906,12 @@ impl App {
     }
 
     fn selected_track(&self) -> Option<String> {
+        if !matches!(
+            self.view,
+            View::AllTracks | View::Liked | View::Queue | View::Playlist(_)
+        ) {
+            return None;
+        }
         self.track_state
             .selected()
             .and_then(|i| self.track_list.get(i))
@@ -662,6 +939,7 @@ impl App {
             k.sort();
             self.play_context = k;
         }
+        self.play_when_ready = None;
         self.play_filename_internal(fname, record_history, true);
     }
 
@@ -681,25 +959,40 @@ impl App {
                 }
             }
         }
+        // Lyrics first, so the filter is in place before the first sample plays.
+        self.refresh_lyrics_for(fname);
         match self.player.play_file(&full, fname) {
             Ok(()) => {
                 self.was_playing_file = true;
                 self.smooth_pos = 0.0;
-                if let Some(e) = self.lib.entries.get_mut(fname) {
+                self.loaded_at = Instant::now();
+                self.last_pb_poll = self.loaded_at;
+                self.seen_active = false;
+                self.pb = PlaybackState {
+                    active: true,
+                    ..PlaybackState::default()
+                };
+                let label = self.edit(|lib| {
+                    let e = lib.entries.get_mut(fname)?;
                     e.last_used = now_ts();
-                    let label = if e.artist.is_empty() {
+                    Some(if e.artist.is_empty() {
                         e.title.clone()
                     } else {
                         format!("{} - {}", e.title, e.artist)
+                    })
+                });
+                if let Some(label) = label {
+                    let unfiltered = if self.lib.censor && self.lrc_lines.is_empty() {
+                        "  (no lyrics yet: audio not censored)"
+                    } else {
+                        ""
                     };
-                    self.set_notice(format!("Playing: {label}"));
+                    self.set_notice(format!("Playing: {label}{unfiltered}"));
                 }
-                save_library(&self.dir, &self.lib);
-                self.refresh_lyrics_for(fname);
-                self.cover_art = None;
                 if rebuild_up {
                     self.rebuild_upcoming(Some(fname));
                 }
+                self.prepare_next();
             }
             Err(e) => {
                 self.set_notice(format!("Playback error: {e}"));
@@ -720,25 +1013,22 @@ impl App {
     }
 
     fn toggle_like(&mut self) {
+        let playing = self.player.current_file.clone();
         let target = if self.focus == Focus::Main {
-            self.selected_track()
-                .or_else(|| self.player.current_file.clone())
+            self.selected_track().or(playing)
         } else {
-            self.player.current_file.clone().or_else(|| self.selected_track())
+            playing.or_else(|| self.selected_track())
         };
-        if let Some(fname) = target {
-            if let Some(e) = self.lib.entries.get_mut(&fname) {
-                e.liked = !e.liked;
-                let st = if e.liked {
-                    "Liked (pinned from LRU eviction)"
-                } else {
-                    "Unliked"
-                };
-                let t = e.title.clone();
-                save_library(&self.dir, &self.lib);
-                self.rebuild_track_list();
-                self.status = format!("{st}: {t}");
-            }
+        let Some(fname) = target else { return };
+        let done = self.edit(|lib| {
+            let e = lib.entries.get_mut(&fname)?;
+            e.liked = !e.liked;
+            Some((e.liked, e.title.clone()))
+        });
+        if let Some((liked, title)) = done {
+            self.rebuild_track_list();
+            let st = if liked { "Liked (never auto-removed)" } else { "Unliked" };
+            self.set_notice(format!("{st}: {title}"));
         }
     }
 
@@ -755,27 +1045,28 @@ impl App {
             return;
         };
         let target = prof.name.trim().to_ascii_lowercase();
-        if let Some(pos) = self
-            .lib
-            .liked_artists
-            .iter()
-            .position(|a| a.name.trim().to_ascii_lowercase() == target)
-        {
-            self.lib.liked_artists.remove(pos);
-            save_library(&self.dir, &self.lib);
-            self.status = format!("Removed '{}' from Liked Artists", prof.name);
-        } else {
-            self.lib.liked_artists.push(LikedArtist {
-                name: prof.name.clone(),
-                spotify_id: prof.spotify_id.clone(),
-                image_url: prof.image_url.clone(),
-            });
-            self.lib
-                .liked_artists
+        let entry = LikedArtist {
+            name: prof.name.clone(),
+            spotify_id: prof.spotify_id.clone(),
+            image_url: prof.image_url.clone(),
+        };
+        let removed = self.edit(|lib| {
+            let before = lib.liked_artists.len();
+            lib.liked_artists
+                .retain(|a| a.name.trim().to_ascii_lowercase() != target);
+            if lib.liked_artists.len() != before {
+                return true;
+            }
+            lib.liked_artists.push(entry);
+            lib.liked_artists
                 .sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
-            save_library(&self.dir, &self.lib);
-            self.status = format!("Liked artist '{}' (added to Library sidebar)", prof.name);
-        }
+            false
+        });
+        self.set_notice(if removed {
+            format!("Unfollowed {}", prof.name)
+        } else {
+            format!("Following {}", prof.name)
+        });
     }
 
     fn open_artist_profile(&mut self, raw_name: &str, known_spotify_id: Option<&str>) {
@@ -811,7 +1102,6 @@ impl App {
         self.artist_loading_name = Some(label.clone());
         self.artist_profile = None;
         self.artist_avatar_path = None;
-        self.artist_avatar_art = None;
         self.artist_tab = ArtistTab::TopTracks;
         self.artist_track_state.select(None);
         self.artist_album_state.select(None);
@@ -894,14 +1184,15 @@ impl App {
             self.was_playing_file = false;
         }
         remove_track_files(&self.dir, fname);
-        self.lib.entries.remove(fname);
-        for pl in &mut self.lib.playlists {
-            pl.tracks.retain(|x| x != fname);
-        }
+        self.edit(|lib| {
+            lib.entries.remove(fname);
+            for pl in &mut lib.playlists {
+                pl.tracks.retain(|x| x != fname);
+            }
+        });
         self.queue.retain(|x| x != fname);
         self.upcoming.retain(|x| x != fname);
         self.play_context.retain(|x| x != fname);
-        save_library(&self.dir, &self.lib);
         self.rebuild_track_list();
         self.set_notice(format!("Deleted '{title}'"));
     }
@@ -1002,7 +1293,6 @@ impl App {
         self.album_loading_name = Some(title.to_string());
         self.album_detail = None;
         self.album_cover_path = None;
-        self.album_cover_art = None;
         self.album_track_state.select(None);
         self.busy = true;
         self.set_notice(format!("Loading '{title}'..."));
@@ -1033,7 +1323,6 @@ impl App {
         self.album_loading_name = Some(album.to_string());
         self.album_detail = None;
         self.album_cover_path = None;
-        self.album_cover_art = None;
         self.album_track_state.select(None);
         self.busy = true;
         self.set_notice(format!("Loading album '{album}'..."));
@@ -1119,39 +1408,55 @@ impl App {
         self.lrc_lines = load_lrc(&self.dir, fname, None);
         self.lrc_file = Some(fname.to_string());
         self.lyrics_scroll_offset = 0;
+        self.apply_censor();
 
-        if !self.lrc_lines.is_empty() {
-            let dir = self.dir.clone();
-            let fname_owned = fname.to_string();
-            let full = dir.join(fname);
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                if let Some(env) = AudioEnvelope::extract(&full) {
-                    let aligned = load_lrc(&dir, &fname_owned, Some(&env));
-                    if !aligned.is_empty() {
-                        let _ = tx.send(WorkerMsg::LyricsAligned(fname_owned, aligned));
+        let dir = self.dir.clone();
+        let tx = self.tx.clone();
+        let file = fname.to_string();
+        if self.lrc_lines.is_empty() {
+            // Older downloads may have no lyrics yet.
+            if let Some(e) = self.lib.entries.get(fname).cloned() {
+                thread::spawn(move || {
+                    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(&file);
+                    if downloader::fetch_synced_lrc(&dir, stem, &e.title, &e.artist, e.duration_sec) {
+                        let _ = tx.send(WorkerMsg::LyricsFetched(file, true));
                     }
-                }
-            });
+                });
+            }
+            return;
         }
+        if self.lrc_lines.iter().any(|l| l.aligned) {
+            return;
+        }
+        if sync::available() {
+            self.aligner.request(fname);
+        }
+        // A quick estimate to show while (or if) the real alignment isn't ready.
+        thread::spawn(move || {
+            if let Some(env) = AudioEnvelope::extract(&dir.join(&file)) {
+                let estimated = load_lrc(&dir, &file, Some(&env));
+                if !estimated.is_empty() {
+                    let _ = tx.send(WorkerMsg::LyricsAligned(file, estimated));
+                }
+            }
+        });
     }
 
     fn adjust_lrc_offset(&mut self, delta_ms: Option<i32>) {
         let Some(fname) = self.player.current_file.clone() else {
             return;
         };
-        if let Some(e) = self.lib.entries.get_mut(&fname) {
+        let off = self.edit(|lib| {
+            let e = lib.entries.get_mut(&fname)?;
             e.lrc_offset_ms = match delta_ms {
                 Some(d) => (e.lrc_offset_ms + d).clamp(-5000, 5000),
                 None => 0,
             };
-            let off = e.lrc_offset_ms;
-            save_library(&self.dir, &self.lib);
-            self.status = if off == 0 {
-                "Lyrics sync offset reset to 0.00s".into()
-            } else {
-                format!("Lyrics sync offset: {:+.2}s (saved)", off as f64 / 1000.0)
-            };
+            Some(e.lrc_offset_ms)
+        });
+        if let Some(off) = off {
+            self.apply_censor();
+            self.set_notice(format!("Lyrics offset {:+.2}s", off as f64 / 1000.0));
         }
     }
 
@@ -1159,70 +1464,78 @@ impl App {
         let cur_mb = (self.max_bytes / 1_048_576) as i64;
         let next_mb = (cur_mb + delta_mb).clamp(100, 10_000) as u64;
         self.max_bytes = next_mb * 1_048_576;
-        self.lib.max_cache_mb = Some(next_mb);
-        save_library(&self.dir, &self.lib);
+        self.edit(|lib| lib.max_cache_mb = Some(next_mb));
         self.status = format!("Cache limit set to {} MB (saved)", next_mb);
     }
 
-    fn ensure_cover_art(&mut self, cols: u16, rows: u16) {
-        if cols < 4 || rows < 2 {
+    /// Changes speed or pitch, saves it and applies it to what is playing.
+    fn change_tune(&mut self, change: impl FnOnce(&mut tempo::Tune)) {
+        let tune = self.edit(|lib| {
+            change(&mut lib.tune);
+            lib.tune
+        });
+        if !self.player.set_tune(tune) {
+            self.set_notice("mpv rejected the speed / pitch change (needs mpv 0.40 or newer)");
             return;
         }
-        let target_fname = self
-            .player
-            .current_file
-            .clone()
-            .or_else(|| self.selected_track());
-        let cover_path = target_fname
-            .as_deref()
-            .and_then(|f| self.cover_path_for(f));
-
-        let Some(path) = cover_path else {
-            self.cover_art = None;
-            return;
-        };
-        let key = path.to_string_lossy().to_string();
-        if let Some(existing) = &self.cover_art {
-            if existing.path_key == key && self.cover_size == (cols, rows) {
-                return;
-            }
-        }
-        self.cover_art = CoverArt::load(&path, cols, rows);
-        self.cover_size = (cols, rows);
+        self.set_notice(format!(
+            "Speed {}  ·  pitch {}  ({})",
+            tune.speed_label(),
+            tune.pitch_label(),
+            if tune.linked { "linked" } else { "independent" }
+        ));
     }
 
-    fn ensure_artist_avatar(&mut self, cols: u16, rows: u16) {
-        if cols < 4 || rows < 2 {
-            return;
-        }
-        let Some(path) = self.artist_avatar_path.clone() else {
-            return;
+    /// Muffles the explicit words of the loaded song (or lifts the filter).
+    fn apply_censor(&mut self) {
+        let ranges = if self.lib.censor {
+            let nudge = self
+                .lrc_file
+                .as_ref()
+                .and_then(|f| self.lib.entries.get(f))
+                .map(|e| e.lrc_offset_ms as f64 / 1000.0)
+                .unwrap_or(0.0);
+            self.censor.audio_ranges(&self.lrc_lines, nudge)
+        } else {
+            Vec::new()
         };
-        let key = path.to_string_lossy().to_string();
-        if let Some(existing) = &self.artist_avatar_art {
-            if existing.path_key == key && self.artist_avatar_size == (cols, rows) {
-                return;
-            }
+        if !self.player.set_censored(ranges, self.lib.censor_style) {
+            self.set_notice("Censor filter failed: mpv rejected the audio filter");
         }
-        self.artist_avatar_art = CoverArt::load(&path, cols, rows);
-        self.artist_avatar_size = (cols, rows);
     }
 
-    fn ensure_album_cover(&mut self, cols: u16, rows: u16) {
-        if cols < 4 || rows < 2 {
-            return;
-        }
-        let Some(path) = self.album_cover_path.clone() else {
-            return;
-        };
-        let key = path.to_string_lossy().to_string();
-        if let Some(existing) = &self.album_cover_art {
-            if existing.path_key == key && self.album_cover_size == (cols, rows) {
-                return;
+    /// With the filter on, time the next song's words before it starts.
+    fn prepare_next(&mut self) {
+        let next = self.queue.front().or_else(|| self.upcoming.front());
+        if let Some(file) = next {
+            if self.lib.censor && sync::available() && sync::needs_alignment(&self.dir, file) {
+                self.aligner.request_later(file);
             }
         }
-        self.album_cover_art = CoverArt::load(&path, cols, rows);
-        self.album_cover_size = (cols, rows);
+    }
+
+    fn cycle_censor_style(&mut self) {
+        let style = self.edit(|lib| {
+            lib.censor_style = lib.censor_style.next();
+            lib.censor_style
+        });
+        self.apply_censor();
+        self.set_notice(format!("Censored words sound: {}", style.label()));
+    }
+
+    fn toggle_censor(&mut self) {
+        let on = self.edit(|lib| {
+            lib.censor = !lib.censor;
+            lib.censor
+        });
+        self.censor = censor::Censor::load();
+        self.apply_censor();
+        self.prepare_next();
+        self.set_notice(if on {
+            "Censor filter on: explicit words are starred out and softened"
+        } else {
+            "Censor filter off"
+        });
     }
 
     fn scroll_lyrics(&mut self, delta: isize) {
@@ -1230,11 +1543,7 @@ impl App {
             self.lyrics_scroll_offset = 0;
             return;
         }
-        let off = self
-            .current_track_entry()
-            .map(|e| e.lrc_offset_ms as f64 / 1000.0)
-            .unwrap_or(0.0);
-        let pos = self.smooth_pos + off;
+        let pos = self.lyric_position();
         let active_idx = self
             .lrc_lines
             .iter()
@@ -1246,7 +1555,8 @@ impl App {
         self.lyrics_scroll_offset = (self.lyrics_scroll_offset + delta).clamp(min_off, max_off);
     }
 
-    fn play_next(&mut self) {
+    /// `ended` is true when the song finished by itself.
+    fn play_next(&mut self, ended: bool) {
         if let Some(q) = self.queue.pop_front() {
             self.play_filename_internal(&q, true, false);
             if matches!(self.view, View::Queue) {
@@ -1254,7 +1564,7 @@ impl App {
             }
             return;
         }
-        if self.repeat == RepeatMode::One {
+        if ended && self.repeat == RepeatMode::One {
             if let Some(cur) = self.player.current_file.clone() {
                 self.play_filename_internal(&cur, false, false);
                 return;
@@ -1292,8 +1602,16 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
+        if self.theme_checked.elapsed() > Duration::from_secs(2) {
+            self.theme_checked = now;
+            let stamp = theme::Theme::stamp();
+            if stamp != self.theme_stamp {
+                self.theme_stamp = stamp;
+                self.theme = theme::Theme::load();
+            }
+        }
         if self.pb.active && !self.pb.paused {
-            self.smooth_pos += dt;
+            self.smooth_pos += dt * self.lib.tune.speed;
             if self.pb.dur > 0.0 {
                 self.smooth_pos = self.smooth_pos.min(self.pb.dur);
             }
@@ -1311,25 +1629,39 @@ impl App {
         }
         if let Some(cur) = self.player.current_file.clone() {
             if self.pb.dur > 1.0 {
-                if let Some(e) = self.lib.entries.get_mut(&cur) {
-                    if e.duration_sec == 0 {
-                        e.duration_sec = self.pb.dur as u64;
-                    }
+                let unknown = self
+                    .lib
+                    .entries
+                    .get(&cur)
+                    .map(|e| e.duration_sec == 0)
+                    .unwrap_or(false);
+                if unknown {
+                    let secs = self.pb.dur as u64;
+                    self.edit(|lib| {
+                        if let Some(e) = lib.entries.get_mut(&cur) {
+                            e.duration_sec = secs;
+                        }
+                    });
                 }
             }
         }
-        if self.was_playing_file && self.pb.idle {
+        if self.pb.active && self.loaded_at.elapsed() > Duration::from_millis(400) {
+            self.seen_active = true;
+        }
+        // mpv can still report "idle" right after a load; don't skip the song for that.
+        let settled = self.seen_active || self.loaded_at.elapsed() > Duration::from_secs(3);
+        if self.was_playing_file && self.pb.idle && settled {
             self.was_playing_file = false;
-            self.play_next();
+            self.play_next(true);
         }
     }
 
     fn poll_worker(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                WorkerMsg::Progress(p) => self.status = p,
-                WorkerMsg::ThumbReady(key, rows) => {
-                    self.thumbs.insert(key, rows);
+                WorkerMsg::Progress(p) => self.set_notice(p),
+                WorkerMsg::ThumbReady(key, path) => {
+                    self.thumbs.insert(key, path);
                 }
                 WorkerMsg::SearchDone(Ok(list)) => {
                     self.busy = false;
@@ -1386,30 +1718,84 @@ impl App {
                     }
                 }
                 WorkerMsg::SearchAlbumsDone(Err(_)) => {}
-                WorkerMsg::DownloadDone(Ok((fname, info)), auto_play) => {
+                WorkerMsg::DownloadDone(job, res) => {
+                    self.active_job = None;
+                    match res {
+                        Ok((fname, info)) => {
+                            if job.liked {
+                                self.edit(|lib| {
+                                    if let Some(e) = lib.entries.get_mut(&fname) {
+                                        e.liked = true;
+                                    }
+                                });
+                            }
+                            self.reload_library();
+                            self.set_notice(info);
+                            if self.play_when_ready == Some(job.id) {
+                                self.play_filename(&fname, true);
+                            } else if sync::available() && sync::needs_alignment(&self.dir, &fname) {
+                                self.aligner.request(&fname);
+                            }
+                        }
+                        Err(e) => self.set_notice(format!("Download failed: {e}")),
+                    }
+                    self.start_next_job();
+                }
+                WorkerMsg::Jobs(label, jobs) => {
                     self.busy = false;
-                    self.reload_library();
-                    self.status = info;
-                    if auto_play {
-                        self.play_filename(&fname, true);
+                    let n = jobs.len();
+                    for job in jobs {
+                        self.request_track(job);
+                    }
+                    self.set_notice(format!("Importing {n} songs from '{label}'"));
+                }
+                WorkerMsg::Repaired(n) => {
+                    if n > 0 {
+                        self.reload_library();
+                        self.art.forget();
+                        self.set_notice(format!("Improved {n} song names and covers"));
+                    }
+                }
+                WorkerMsg::Synced(file, res) => {
+                    if self.lrc_file.as_deref() == Some(file.as_str()) {
+                        match res {
+                            Ok((0, _)) => self.set_notice(
+                                "These lyrics don't match this audio (press S to search again)",
+                            ),
+                            Ok((n, total)) => {
+                                self.lrc_lines = load_lrc(&self.dir, &file, None);
+                                self.apply_censor();
+                                self.set_notice(format!("Lyrics synced to audio ({n}/{total} lines)"));
+                            }
+                            Err(e) => self.set_notice(format!("Lyric sync failed: {e}")),
+                        }
+                    }
+                }
+                WorkerMsg::LyricsFetched(file, found) => {
+                    if self.lrc_file.as_deref() == Some(file.as_str()) {
+                        if found {
+                            self.lrc_file = None;
+                            self.refresh_lyrics_for(&file);
+                        } else {
+                            self.set_notice("No matching synced lyrics found");
+                        }
                     }
                 }
                 WorkerMsg::ImportDone(Ok(info)) => {
                     self.busy = false;
                     self.reload_library();
-                    self.status = info;
-                }
-                WorkerMsg::DownloadDone(Err(e), _) => {
-                    self.busy = false;
-                    self.status = format!("Download failed: {e}");
+                    self.set_notice(info);
                 }
                 WorkerMsg::ImportDone(Err(e)) => {
                     self.busy = false;
-                    self.status = format!("Import failed: {e}");
+                    self.set_notice(format!("Import failed: {e}"));
                 }
                 WorkerMsg::LyricsAligned(fname, lines) => {
-                    if self.lrc_file.as_deref() == Some(fname.as_str()) {
+                    if self.lrc_file.as_deref() == Some(fname.as_str())
+                        && !self.lrc_lines.iter().any(|l| l.aligned)
+                    {
                         self.lrc_lines = lines;
+                        self.apply_censor();
                     }
                 }
                 WorkerMsg::SpotifyLoginDone(Ok(sess)) => {
@@ -1488,7 +1874,6 @@ impl App {
                     self.artist_album_state.select(if al_n > 0 { Some(0) } else { None });
                     self.artist_profile = Some(prof);
                     self.artist_avatar_path = avatar_path;
-                    self.artist_avatar_art = None;
                     self.set_notice(format!("Artist: {name} ({n} top tracks, {al_n} releases)"));
                 }
                 WorkerMsg::ArtistLoaded(Err(e)) => {
@@ -1504,7 +1889,6 @@ impl App {
                     self.album_track_state.select(if n > 0 { Some(0) } else { None });
                     self.album_detail = Some(det);
                     self.album_cover_path = cover_path;
-                    self.album_cover_art = None;
                     self.set_notice(format!("Album: {title} ({n} tracks)"));
                 }
                 WorkerMsg::AlbumLoaded(Err(e)) => {
@@ -1652,223 +2036,101 @@ impl App {
         let Some(tr) = self.spotify_tracks.get(idx).cloned() else {
             return;
         };
-        if auto_play {
-            if let Some(cached) = find_cached_track(&self.lib, &tr.title, &tr.artist) {
-                self.play_filename(&cached, true);
-                return;
+        let col = self.spotify_open_col.clone();
+        let mut job = Job::from_spec(&tr, col.as_ref().and_then(|c| c.cover_url.as_deref()));
+        job.play = auto_play;
+        if let Some(c) = col {
+            match c.kind {
+                SpotifyCollectionKind::LikedSongs => job.liked = true,
+                SpotifyCollectionKind::Playlist { .. }
+                | SpotifyCollectionKind::Album { .. }
+                | SpotifyCollectionKind::PublicUrl { .. } => job.playlist = Some(c.name),
+                _ => {}
             }
         }
-        if self.busy {
-            return;
-        }
-        let col = self.spotify_open_col.clone();
-        let is_liked_col = matches!(
-            col.as_ref().map(|c| &c.kind),
-            Some(SpotifyCollectionKind::LikedSongs)
-        );
-        let pl_name = col.as_ref().and_then(|c| match &c.kind {
-            SpotifyCollectionKind::Playlist { .. }
-            | SpotifyCollectionKind::Album { .. }
-            | SpotifyCollectionKind::PublicUrl { .. } => Some(c.name.clone()),
-            _ => None,
-        });
-        let fallback_cover = col.and_then(|c| c.cover_url);
-        self.spawn_spec_download(tr, fallback_cover, pl_name, is_liked_col, auto_play);
+        self.request_track(job);
     }
 
     fn start_artist_download_track(&mut self, idx: usize, auto_play: bool) {
-        let Some(prof) = self.artist_profile.clone() else {
+        let Some(prof) = self.artist_profile.as_ref() else {
             return;
         };
-        let Some(tr) = prof.top_tracks.get(idx).cloned() else {
+        let Some(tr) = prof.top_tracks.get(idx) else {
             return;
         };
-        if auto_play {
-            if let Some(cached) = find_cached_track(&self.lib, &tr.title, &tr.artist) {
-                self.play_filename(&cached, true);
-                return;
-            }
-        }
-        if self.busy {
-            return;
-        }
-        self.spawn_spec_download(tr, prof.image_url, None, false, auto_play);
+        let mut job = Job::from_spec(tr, prof.image_url.as_deref());
+        job.play = auto_play;
+        self.request_track(job);
     }
 
     fn start_album_download_track(&mut self, idx: usize, auto_play: bool) {
-        let Some(det) = self.album_detail.clone() else {
+        let Some(det) = self.album_detail.as_ref() else {
             return;
         };
-        let Some(tr) = det.tracks.get(idx).cloned() else {
+        let Some(tr) = det.tracks.get(idx) else {
             return;
         };
-        if auto_play {
-            if let Some(cached) = find_cached_track(&self.lib, &tr.title, &tr.artist) {
-                self.play_filename(&cached, true);
-                return;
-            }
-        }
-        if self.busy {
-            return;
-        }
-        self.spawn_spec_download(tr, det.cover_url, None, false, auto_play);
+        let mut job = Job::from_spec(tr, det.cover_url.as_deref());
+        job.play = auto_play;
+        self.request_track(job);
     }
 
     fn start_album_import_all(&mut self) {
-        if self.busy {
-            return;
-        }
         let Some(det) = self.album_detail.clone() else {
             return;
         };
-        if det.tracks.is_empty() {
-            return;
-        }
-        let label = det.title.clone();
-        self.spawn_bulk_import(
-            det.tracks,
-            det.cover_url,
-            Some(label.clone()),
-            false,
-            label,
-        );
-    }
-
-    fn spawn_spec_download(
-        &mut self,
-        tr: SpotifyTrackSpec,
-        fallback_cover: Option<String>,
-        pl_name: Option<String>,
-        mark_liked: bool,
-        auto_play: bool,
-    ) {
-        self.busy = true;
-        self.status = format!(
-            "Downloading '{} - {}'{}...",
-            tr.artist,
-            tr.title,
-            if auto_play { " (will play when ready)" } else { "" }
-        );
-        let dir = self.dir.clone();
-        let max_bytes = self.max_bytes;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let q = format!("ytsearch1:{} {} audio", tr.artist, tr.title);
-            let res = download_and_cache_track(
-                &dir,
-                &q,
-                &tr.title,
-                &tr.artist,
-                &tr.album,
-                tr.cover_url.as_deref().or(fallback_cover.as_deref()),
-                tr.duration_sec,
-                pl_name.as_deref(),
-                max_bytes,
-            );
-            if mark_liked {
-                if let Ok((ref fname, _)) = res {
-                    let mut lib = load_and_sync_library(&dir);
-                    if let Some(e) = lib.entries.get_mut(fname) {
-                        e.liked = true;
-                        save_library(&dir, &lib);
-                    }
-                }
-            }
-            let _ = tx.send(WorkerMsg::DownloadDone(res, auto_play));
-        });
+        self.queue_collection(det.tracks, det.cover_url, Some(det.title.clone()), false, det.title);
     }
 
     fn start_spotify_import_all(&mut self) {
-        if self.busy || self.spotify_tracks.is_empty() {
-            return;
-        }
         let Some(col) = self.spotify_open_col.clone() else {
             return;
         };
-        let tracks = self.spotify_tracks.clone();
-        let is_liked_col = matches!(col.kind, SpotifyCollectionKind::LikedSongs);
-        let pl_name = match &col.kind {
-            SpotifyCollectionKind::LikedSongs => None,
-            _ => Some(col.name.clone()),
-        };
-        let fallback_cover = col.cover_url.clone();
-        let col_label = col.name.clone();
-        self.spawn_bulk_import(tracks, fallback_cover, pl_name, is_liked_col, col_label);
+        let liked = matches!(col.kind, SpotifyCollectionKind::LikedSongs);
+        let playlist = (!liked).then(|| col.name.clone());
+        self.queue_collection(self.spotify_tracks.clone(), col.cover_url, playlist, liked, col.name);
     }
 
     fn start_artist_import_all(&mut self) {
-        if self.busy {
-            return;
-        }
         let Some(prof) = self.artist_profile.clone() else {
             return;
         };
-        if prof.top_tracks.is_empty() {
-            return;
-        }
         let label = format!("{} Top Tracks", prof.name);
-        self.spawn_bulk_import(
-            prof.top_tracks,
-            prof.image_url,
-            Some(label.clone()),
-            false,
-            label,
-        );
+        self.queue_collection(prof.top_tracks, prof.image_url, Some(label.clone()), false, label);
     }
 
-    fn spawn_bulk_import(
+    fn queue_collection(
         &mut self,
         tracks: Vec<SpotifyTrackSpec>,
-        fallback_cover: Option<String>,
-        pl_name: Option<String>,
-        mark_liked: bool,
-        col_label: String,
+        cover: Option<String>,
+        playlist: Option<String>,
+        liked: bool,
+        label: String,
     ) {
-        self.busy = true;
-        self.status = format!("Importing {} tracks from '{}'...", tracks.len(), col_label);
-        let dir = self.dir.clone();
-        let max_bytes = self.max_bytes;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let total = tracks.len();
-            let mut ok_count = 0usize;
-            for (idx, tr) in tracks.iter().enumerate() {
-                let _ = tx.send(WorkerMsg::Progress(format!(
-                    "Import [{}/{}] Downloading {} - {}...",
-                    idx + 1,
-                    total,
-                    tr.artist,
-                    tr.title
-                )));
-                let q = format!("ytsearch1:{} {} audio", tr.artist, tr.title);
-                if let Ok((fname, _)) = download_and_cache_track(
-                    &dir,
-                    &q,
-                    &tr.title,
-                    &tr.artist,
-                    &tr.album,
-                    tr.cover_url.as_deref().or(fallback_cover.as_deref()),
-                    tr.duration_sec,
-                    pl_name.as_deref(),
-                    max_bytes,
-                ) {
-                    if mark_liked {
-                        let mut lib = load_and_sync_library(&dir);
-                        if let Some(e) = lib.entries.get_mut(&fname) {
-                            e.liked = true;
-                            save_library(&dir, &lib);
-                        }
+        if tracks.is_empty() {
+            return;
+        }
+        let jobs = collection_jobs(&tracks, cover.as_deref(), playlist.as_deref(), liked);
+        // Songs already on disk only need adding to the playlist.
+        let have: Vec<String> = jobs.iter().filter_map(|j| self.find_saved(j)).collect();
+        self.edit(|lib| {
+            for file in &have {
+                if let Some(name) = &playlist {
+                    add_track_to_playlist(lib, name, file);
+                }
+                if liked {
+                    if let Some(e) = lib.entries.get_mut(file) {
+                        e.liked = true;
                     }
-                    ok_count += 1;
                 }
             }
-            let summary = if mark_liked {
-                format!("Imported {ok_count}/{total} tracks into * Liked")
-            } else {
-                format!("Imported {ok_count}/{total} tracks into playlist '{col_label}'")
-            };
-            let _ = tx.send(WorkerMsg::ImportDone(Ok(summary)));
         });
+        let missing: Vec<Job> = jobs.into_iter().filter(|j| self.find_saved(j).is_none()).collect();
+        let n = missing.len();
+        for job in missing {
+            self.request_track(job);
+        }
+        self.set_notice(format!("'{label}': {n} to download, {} already saved", have.len()));
     }
 
     fn logout_spotify(&mut self) {
@@ -1931,42 +2193,12 @@ impl App {
         let Some(i) = self.search_state.selected() else {
             return;
         };
-        let Some(item) = self.search_results.get(i).cloned() else {
+        let Some(item) = self.search_results.get(i) else {
             return;
         };
-        if auto_play {
-            if let Some(cached) = find_cached_track(&self.lib, &item.title, &item.uploader) {
-                self.play_filename(&cached, true);
-                return;
-            }
-        }
-        if self.busy {
-            return;
-        }
-        self.busy = true;
-        self.status = format!(
-            "Downloading '{}'{}...",
-            item.title,
-            if auto_play { " (will play when ready)" } else { "" }
-        );
-        let dir = self.dir.clone();
-        let max_bytes = self.max_bytes;
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let url = format!("https://www.youtube.com/watch?v={}", item.id);
-            let res = download_and_cache_track(
-                &dir,
-                &url,
-                &item.title,
-                &item.uploader,
-                "",
-                Some(&item.thumbnail),
-                0,
-                None,
-                max_bytes,
-            );
-            let _ = tx.send(WorkerMsg::DownloadDone(res, auto_play));
-        });
+        let mut job = Job::from_upload(item);
+        job.play = auto_play;
+        self.request_track(job);
     }
 
     fn start_smart_import(&mut self, raw: String) {
@@ -1988,48 +2220,11 @@ impl App {
         if expand_local_path(&input).exists() {
             let local_p = expand_local_path(&input);
             if let Some(bundle) = parse_spotify_export_file(&local_p) {
-                self.status = format!(
-                    "Importing {} tracks from '{}'...",
-                    bundle.tracks.len(),
-                    bundle.collection_name
-                );
-                thread::spawn(move || {
-                    let total = bundle.tracks.len();
-                    let pl_name = Some(bundle.collection_name.as_str());
-                    let mut ok_count = 0usize;
-                    for (idx, tr) in bundle.tracks.iter().enumerate() {
-                        let _ = tx.send(WorkerMsg::Progress(format!(
-                            "Export [{}/{}] Downloading {} - {}...",
-                            idx + 1,
-                            total,
-                            tr.artist,
-                            tr.title
-                        )));
-                        let q = format!("ytsearch1:{} {} audio", tr.artist, tr.title);
-                        if download_and_cache_track(
-                            &dir,
-                            &q,
-                            &tr.title,
-                            &tr.artist,
-                            &tr.album,
-                            None,
-                            tr.duration_sec,
-                            pl_name,
-                            max_bytes,
-                        )
-                        .is_ok()
-                        {
-                            ok_count += 1;
-                        }
-                    }
-                    let _ = tx.send(WorkerMsg::ImportDone(Ok(format!(
-                        "Imported {ok_count}/{total} tracks into playlist '{}'",
-                        bundle.collection_name
-                    ))));
-                });
+                let jobs = collection_jobs(&bundle.tracks, None, Some(&bundle.collection_name), false);
+                let _ = tx.send(WorkerMsg::Jobs(bundle.collection_name, jobs));
                 return;
             }
-            self.status = format!("Importing local music from '{input}'...");
+            self.set_notice(format!("Importing local music from '{input}'..."));
             thread::spawn(move || {
                 let res = import_local_music(&dir, &input, max_bytes);
                 let _ = tx.send(WorkerMsg::ImportDone(res));
@@ -2038,98 +2233,33 @@ impl App {
         }
 
         if input.contains("open.spotify.com/") || input.starts_with("spotify:") {
-            self.status = "Fetching Spotify metadata...".into();
+            self.set_notice("Fetching Spotify metadata...");
             thread::spawn(move || {
-                let bundle = match fetch_spotify_metadata(&input) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let _ = tx.send(WorkerMsg::ImportDone(Err(e)));
-                        return;
+                let msg = match fetch_spotify_metadata(&input) {
+                    Ok(b) => {
+                        let playlist = (b.kind != "track").then_some(b.collection_name.as_str());
+                        let jobs = collection_jobs(&b.tracks, b.cover_url.as_deref(), playlist, false);
+                        WorkerMsg::Jobs(b.collection_name.clone(), jobs)
                     }
+                    Err(e) => WorkerMsg::ImportDone(Err(e)),
                 };
-                let total = bundle.tracks.len();
-                let pl_name = if bundle.kind == "track" {
-                    None
-                } else {
-                    Some(bundle.collection_name.as_str())
-                };
-                let mut ok_count = 0usize;
-                for (idx, tr) in bundle.tracks.iter().enumerate() {
-                    let _ = tx.send(WorkerMsg::Progress(format!(
-                        "Spotify [{}/{}] Downloading {} - {}...",
-                        idx + 1,
-                        total,
-                        tr.artist,
-                        tr.title
-                    )));
-                    let q = format!("ytsearch1:{} {} audio", tr.artist, tr.title);
-                    if download_and_cache_track(
-                        &dir,
-                        &q,
-                        &tr.title,
-                        &tr.artist,
-                        &tr.album,
-                        tr.cover_url.as_deref().or(bundle.cover_url.as_deref()),
-                        tr.duration_sec,
-                        pl_name,
-                        max_bytes,
-                    )
-                    .is_ok()
-                    {
-                        ok_count += 1;
-                    }
-                }
-                let summary = if let Some(pl) = pl_name {
-                    format!("Imported {ok_count}/{total} tracks into playlist '{pl}'")
-                } else {
-                    format!("Imported {ok_count}/{total} track from Spotify")
-                };
-                let _ = tx.send(WorkerMsg::ImportDone(Ok(summary)));
+                let _ = tx.send(msg);
             });
             return;
         }
 
-        self.status = format!("Importing '{input}'...");
-        thread::spawn(move || match search_youtube(&input) {
-            Ok(list) if !list.is_empty() => {
-                let is_url = input.starts_with("http://") || input.starts_with("https://");
-                let items: Vec<SearchResult> = if is_url { list } else { vec![list[0].clone()] };
-                let total = items.len();
-                let mut ok_count = 0usize;
-                for (idx, item) in items.iter().enumerate() {
-                    let _ = tx.send(WorkerMsg::Progress(format!(
-                        "Downloading [{}/{}] {}...",
-                        idx + 1,
-                        total,
-                        item.title
-                    )));
-                    let url = format!("https://www.youtube.com/watch?v={}", item.id);
-                    if download_and_cache_track(
-                        &dir,
-                        &url,
-                        &item.title,
-                        &item.uploader,
-                        "",
-                        Some(&item.thumbnail),
-                        0,
-                        None,
-                        max_bytes,
-                    )
-                    .is_ok()
-                    {
-                        ok_count += 1;
-                    }
+        self.set_notice(format!("Looking up '{input}'..."));
+        thread::spawn(move || {
+            let msg = match search_youtube(&input) {
+                Ok(list) if !list.is_empty() => {
+                    let take = if input.starts_with("http") { list.len() } else { 1 };
+                    let jobs = list.iter().take(take).map(Job::from_upload).collect();
+                    WorkerMsg::Jobs(input, jobs)
                 }
-                let _ = tx.send(WorkerMsg::ImportDone(Ok(format!(
-                    "Imported {ok_count}/{total} track(s)"
-                ))));
-            }
-            Ok(_) => {
-                let _ = tx.send(WorkerMsg::ImportDone(Err(format!("Nothing found for '{input}'"))));
-            }
-            Err(e) => {
-                let _ = tx.send(WorkerMsg::ImportDone(Err(e)));
-            }
+                Ok(_) => WorkerMsg::ImportDone(Err(format!("Nothing found for '{input}'"))),
+                Err(e) => WorkerMsg::ImportDone(Err(e)),
+            };
+            let _ = tx.send(msg);
         });
     }
 
@@ -2156,7 +2286,7 @@ impl App {
             ButtonAction::Settings => self.open_settings_view(),
             ButtonAction::Prev => self.play_prev(),
             ButtonAction::PlayPause => self.toggle_play_or_start(),
-            ButtonAction::Next => self.play_next(),
+            ButtonAction::Next => self.play_next(false),
             ButtonAction::Shuffle => {
                 self.shuffle = !self.shuffle;
                 let cur = self.player.current_file.clone();
@@ -2204,9 +2334,10 @@ impl App {
             ButtonAction::CacheDec => self.adjust_cache_limit(-100),
             ButtonAction::CacheInc => self.adjust_cache_limit(100),
             ButtonAction::PruneCache => {
-                let (n, freed) = prune_lru(&self.dir, &mut self.lib, self.max_bytes);
+                let (dir, max) = (self.dir.clone(), self.max_bytes);
+                let (n, freed) = self.edit(|lib| prune_lru(&dir, lib, max));
                 self.rebuild_track_list();
-                self.status = if n > 0 {
+                self.set_notice(if n > 0 {
                     format!("Pruned {n} tracks (freed {})", fmt_mb(freed))
                 } else {
                     format!(
@@ -2214,7 +2345,7 @@ impl App {
                         fmt_mb(self.max_bytes),
                         fmt_mb(total_cache_bytes(&self.lib))
                     )
-                };
+                });
             }
             ButtonAction::SpotifyAddUrl => {
                 if !self.busy {
@@ -2251,6 +2382,12 @@ impl App {
                 self.show_downloads_menu = false;
             }
             ButtonAction::ToggleLikeArtist => self.toggle_like_current_artist(),
+            ButtonAction::ToggleCensor => self.toggle_censor(),
+            ButtonAction::CensorStyle => self.cycle_censor_style(),
+            ButtonAction::Speed(up) => self.change_tune(|t| t.step_speed(up)),
+            ButtonAction::Pitch(up) => self.change_tune(|t| t.step_pitch(up)),
+            ButtonAction::ToggleTuneLink => self.change_tune(tempo::Tune::toggle_link),
+            ButtonAction::ResetTune => self.change_tune(tempo::Tune::reset),
             ButtonAction::ArtistImportAll => self.start_artist_import_all(),
             ButtonAction::ArtistTab(tab) => {
                 self.artist_tab = tab;
@@ -2434,6 +2571,12 @@ impl App {
                     return;
                 }
 
+                // List borders are not rows.
+                let list = self.hits.track_list;
+                if rect_contains(list, col, row) && (row == list.y || row + 1 == list.bottom()) {
+                    return;
+                }
+
                 if !matches!(
                     self.input_mode,
                     InputMode::Normal
@@ -2489,22 +2632,14 @@ impl App {
                 let tl = self.hits.track_list;
                 if rect_contains(tl, col, row) {
                     let rel_y = row.saturating_sub(tl.y + 1) as usize;
-                    let rel_x = col.saturating_sub(tl.x + 1);
                     match &self.input_mode {
                         InputMode::SearchResults => {
                             if self.search_tab == SearchTab::Songs {
                                 // Search rows are 2 lines tall with 4x2 thumbnail
                                 let idx = self.search_state.offset() + (rel_y / 2);
-                                let on_line2 = (rel_y % 2) == 1;
                                 if idx < self.search_results.len() {
                                     self.search_state.select(Some(idx));
-                                    if on_line2 && rel_x >= 6 {
-                                        // Clicked the artist line -> load Artist Profile from Spotify!
-                                        let artist = self.search_results[idx].uploader.clone();
-                                        self.open_artist_profile(&artist, None);
-                                    } else {
-                                        self.start_download_search_result(true);
-                                    }
+                                    self.start_download_search_result(true);
                                 }
                             } else {
                                 let albums = self.filtered_search_albums();
@@ -2520,8 +2655,7 @@ impl App {
                             let idx = self.playlist_pick_state.offset() + rel_y;
                             if let Some(pl) = self.lib.playlists.get(idx) {
                                 let pl_name = pl.name.clone();
-                                add_track_to_playlist(&mut self.lib, &pl_name, &fname);
-                                save_library(&self.dir, &self.lib);
+                                self.edit(|lib| add_track_to_playlist(lib, &pl_name, &fname));
                                 self.status = format!("Added to playlist '{pl_name}'");
                                 self.input_mode = InputMode::Normal;
                             }
@@ -2571,15 +2705,9 @@ impl App {
                                 self.input_mode = InputMode::SearchResults;
                                 if self.search_tab == SearchTab::Songs {
                                     let idx = self.search_state.offset() + (rel_y / 2);
-                                    let on_line2 = (rel_y % 2) == 1;
                                     if idx < self.search_results.len() {
                                         self.search_state.select(Some(idx));
-                                        if on_line2 && rel_x >= 6 {
-                                            let artist = self.search_results[idx].uploader.clone();
-                                            self.open_artist_profile(&artist, None);
-                                        } else {
-                                            self.start_download_search_result(true);
-                                        }
+                                        self.start_download_search_result(true);
                                     }
                                 } else {
                                     let albums = self.filtered_search_albums();
@@ -2593,23 +2721,9 @@ impl App {
                             }
                             // Library track rows: 2 lines tall with 4x2 thumbnail
                             let idx = self.track_state.offset() + (rel_y / 2);
-                            let on_line2 = (rel_y % 2) == 1;
                             if idx < self.track_list.len() {
                                 self.focus = Focus::Main;
                                 let fname = self.track_list[idx].clone();
-                                // Check if user clicked the Artist name on line 2!
-                                if on_line2 {
-                                    if let Some(e) = self.lib.entries.get(&fname) {
-                                        let artist_clean = clean_artist_name(&e.artist);
-                                        let artist_len = artist_clean.chars().count() as u16;
-                                        // Line 2 layout: "| " (2) + thumb (4) + " " (1) + "   " (3) = col 10 start
-                                        if artist_len > 0 && rel_x >= 9 && rel_x <= 10 + artist_len + 1 {
-                                            self.track_state.select(Some(idx));
-                                            self.open_artist_profile(&artist_clean, None);
-                                            return;
-                                        }
-                                    }
-                                }
                                 let already_sel = self.track_state.selected() == Some(idx);
                                 let quick_repeat = self
                                     .last_click
@@ -2778,6 +2892,23 @@ impl App {
     }
 }
 
+fn collection_jobs(
+    tracks: &[SpotifyTrackSpec],
+    cover: Option<&str>,
+    playlist: Option<&str>,
+    liked: bool,
+) -> Vec<Job> {
+    tracks
+        .iter()
+        .map(|tr| {
+            let mut job = Job::from_spec(tr, cover);
+            job.playlist = playlist.map(str::to_string);
+            job.liked = liked;
+            job
+        })
+        .collect()
+}
+
 fn spawn_thumb_fetcher(jobs: Vec<(String, String)>, tx: Sender<WorkerMsg>) {
     if jobs.is_empty() {
         return;
@@ -2793,9 +2924,7 @@ fn spawn_thumb_fetcher(jobs: Vec<(String, String)>, tx: Sender<WorkerMsg>) {
         thread::spawn(move || {
             for (key, url) in bucket {
                 if let Some(path) = fetch_remote_image_to_temp(&url, &key) {
-                    if let Some(rows) = decode_thumb(&path) {
-                        let _ = tx_c.send(WorkerMsg::ThumbReady(key, rows));
-                    }
+                    let _ = tx_c.send(WorkerMsg::ThumbReady(key, path));
                 }
             }
         });
@@ -2816,364 +2945,17 @@ fn fmt_fans(n: u64) -> String {
     }
 }
 
-fn render_inline_buttons(
-    defs: Vec<(String, Style, Option<ButtonAction>)>,
-    area: Rect,
-    top_offset: u16,
-    hits: &mut Vec<(Rect, ButtonAction)>,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    let mut cursor_x = area.x + 1;
-    let max_x = area.x + area.width.saturating_sub(1);
-    let btn_y = area.y + top_offset;
-    for (label, style, action_opt) in defs {
-        let w = label.chars().count() as u16;
-        if cursor_x + w > max_x {
-            break;
-        }
-        if let Some(action) = action_opt {
-            hits.push((Rect::new(cursor_x, btn_y, w, 1), action));
-        }
-        spans.push(Span::styled(label, style));
-        cursor_x += w;
-        if cursor_x + 1 < max_x {
-            spans.push(Span::raw(" "));
-            cursor_x += 1;
-        }
-    }
-    Line::from(spans)
-}
-
-fn wrap_plain_text(text: &str, max_w: usize) -> Vec<String> {
-    let mut rows = Vec::new();
-    let mut cur = String::new();
-    for w in text.split_whitespace() {
-        let wlen = w.chars().count();
-        let clen = cur.chars().count();
-        if !cur.is_empty() && clen + 1 + wlen > max_w {
-            rows.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(w);
-    }
-    if !cur.is_empty() {
-        rows.push(cur);
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-    rows
-}
-
-/// Clean, vertically-centered truecolor word-by-word synced lyrics with manual scrolling,
-/// hover highlight, click-to-seek timestamp mapping, and clickable `[?]` Genius triggers.
-fn render_word_synced_lyrics(
-    app: &App,
-    lrc_area: Rect,
-) -> (Vec<Line<'static>>, Vec<(u16, usize, f64)>, Vec<(Rect, usize)>) {
-    let h = lrc_area.height.saturating_sub(2) as usize;
-    let inner_w = lrc_area.width.saturating_sub(8).max(16) as usize;
-    let (mx, my) = app.mouse_pos;
-    let mouse_in_lyrics = rect_contains(lrc_area, mx, my);
-
-    if app.lrc_lines.is_empty() {
-        let pad = h / 2;
-        let mut lines: Vec<Line<'static>> = (0..pad).map(|_| Line::from("")).collect();
-        lines.push(Line::from(Span::styled(
-            if app.player.current_file.is_some() {
-                "No synced lyrics for this track"
-            } else {
-                "Play a track to see live lyrics"
-            },
-            Style::default().fg(Color::Rgb(84, 84, 92)),
-        )));
-        return (lines, Vec::new(), Vec::new());
-    }
-
-    let offset_sec = app
-        .current_track_entry()
-        .map(|e| e.lrc_offset_ms as f64 / 1000.0)
-        .unwrap_or(0.0);
-    let pos = app.smooth_pos + offset_sec;
-
-    let active_opt = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos);
-    let active_idx = active_opt.unwrap_or(0);
-    let has_started = active_opt.is_some();
-
-    let max_idx = app.lrc_lines.len().saturating_sub(1);
-    let view_idx = (active_idx as isize + app.lyrics_scroll_offset).clamp(0, max_idx as isize) as usize;
-
-    // Helper to build the live word-by-word active bar rows + hairline
-    let build_active_block = || -> (Vec<Vec<Span<'static>>>, Line<'static>) {
-        let active_entry = &app.lrc_lines[active_idx];
-        let mut active_rows: Vec<Vec<Span<'static>>> = Vec::new();
-        let mut current_row: Vec<Span<'static>> = Vec::new();
-        let mut row_len = 0usize;
-        let mut bar_start = f64::MAX;
-        let mut bar_end = 0.0f64;
-
-        for (wi, w) in active_entry.words.iter().enumerate() {
-            bar_start = bar_start.min(w.start);
-            bar_end = bar_end.max(w.end);
-
-            let w_chars: Vec<char> = w.text.chars().collect();
-            let w_len = w_chars.len();
-            let need_space = if current_row.is_empty() { 0 } else { 1 };
-            if !current_row.is_empty() && row_len + need_space + w_len > inner_w {
-                active_rows.push(std::mem::take(&mut current_row));
-                row_len = 0;
-            }
-            if !current_row.is_empty() {
-                current_row.push(Span::raw(" "));
-                row_len += 1;
-            }
-
-            let dur = (w.end - w.start).max(0.07);
-            let (active_fg, unlit_active_fg, sung_style, upcoming_fg) = if w.is_adlib {
-                (
-                    Color::Rgb(242, 202, 92),
-                    Color::Rgb(138, 122, 82),
-                    Style::default().fg(Color::Rgb(192, 166, 98)),
-                    Color::Rgb(84, 84, 92),
-                )
-            } else {
-                (
-                    Color::Rgb(118, 238, 148),
-                    Color::Rgb(132, 136, 144),
-                    Style::default()
-                        .fg(Color::Rgb(244, 244, 246))
-                        .add_modifier(Modifier::BOLD),
-                    Color::Rgb(96, 98, 106),
-                )
-            };
-
-            if pos >= w.end {
-                current_row.push(Span::styled(w.text.clone(), sung_style));
-            } else if pos >= w.start {
-                let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
-                let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
-                let lit: String = w_chars[..split_at].iter().collect();
-                let rest: String = w_chars[split_at..].iter().collect();
-                current_row.push(Span::styled(
-                    lit,
-                    Style::default().fg(active_fg).add_modifier(Modifier::BOLD),
-                ));
-                if !rest.is_empty() {
-                    current_row.push(Span::styled(rest, Style::default().fg(unlit_active_fg)));
-                }
-            } else {
-                current_row.push(Span::styled(w.text.clone(), Style::default().fg(upcoming_fg)));
-            }
-            row_len += w_len;
-
-            if wi + 1 == active_entry.words.len() && !current_row.is_empty() {
-                active_rows.push(std::mem::take(&mut current_row));
-            }
-        }
-
-        let bar_w = inner_w.min(26).max(8);
-        let bar_frac = if bar_end > bar_start {
-            ((pos - bar_start) / (bar_end - bar_start)).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let filled = ((bar_w as f64) * bar_frac).round() as usize;
-        let bar_line = Line::from(vec![
-            Span::styled(
-                "─".repeat(filled),
-                Style::default().fg(Color::Rgb(118, 238, 148)),
-            ),
-            Span::styled(
-                "─".repeat(bar_w.saturating_sub(filled)),
-                Style::default().fg(Color::Rgb(46, 48, 54)),
-            ),
-        ]);
-        (active_rows, bar_line)
-    };
-
-    let (active_rows_opt, bar_line_opt) = if has_started {
-        let (ar, bl) = build_active_block();
-        (Some(ar), Some(bl))
-    } else {
-        (None, None)
-    };
-
-    // Build centered viewport rows around `view_idx` (so scrolling smoothly moves through ALL lyrics!)
-    enum RawRow {
-        Blank,
-        Plain {
-            text: String,
-            idx: usize,
-            t: f64,
-            color: Color,
-        },
-        Active {
-            spans: Vec<Span<'static>>,
-            idx: usize,
-            t: f64,
-            show_help: bool,
-        },
-        Bar(Line<'static>),
-    }
-
-    let make_line_rows = |idx: usize, is_center_focus: bool| -> Vec<RawRow> {
-        if has_started && idx == active_idx {
-            let mut v = Vec::new();
-            v.push(RawRow::Blank);
-            if let Some(ref ar) = active_rows_opt {
-                let t = app.lrc_lines[idx].time_sec;
-                for (ri, sp) in ar.iter().enumerate() {
-                    v.push(RawRow::Active {
-                        spans: sp.clone(),
-                        idx,
-                        t,
-                        show_help: ri == 0,
-                    });
-                }
-            }
-            if let Some(ref bl) = bar_line_opt {
-                v.push(RawRow::Bar(bl.clone()));
-            }
-            v.push(RawRow::Blank);
-            v
-        } else {
-            let dist = idx.abs_diff(if has_started { active_idx } else { view_idx });
-            let color = if app.lyrics_scroll_offset != 0 && is_center_focus {
-                Color::Rgb(126, 130, 142)
-            } else if dist == 1 {
-                Color::Rgb(82, 82, 90)
-            } else {
-                Color::Rgb(56, 56, 62)
-            };
-            let t = app.lrc_lines[idx].time_sec;
-            wrap_plain_text(&app.lrc_lines[idx].text, inner_w)
-                .into_iter()
-                .map(|text| RawRow::Plain { text, idx, t, color })
-                .collect()
-        }
-    };
-
-    let center_rows = make_line_rows(view_idx, true);
-    let avail_above = h.saturating_sub(center_rows.len()) / 2;
-    let avail_below = h.saturating_sub(center_rows.len() + avail_above);
-
-    let mut above_rows: Vec<RawRow> = Vec::new();
-    for back in 1..=view_idx {
-        if above_rows.len() >= avail_above {
-            break;
-        }
-        let idx = view_idx - back;
-        for r in make_line_rows(idx, false).into_iter().rev() {
-            if above_rows.len() >= avail_above {
-                break;
-            }
-            above_rows.push(r);
-        }
-    }
-    above_rows.reverse();
-
-    let mut below_rows: Vec<RawRow> = Vec::new();
-    for fwd in 1.. {
-        let idx = view_idx + fwd;
-        if idx >= app.lrc_lines.len() || below_rows.len() >= avail_below {
-            break;
-        }
-        for r in make_line_rows(idx, false) {
-            if below_rows.len() >= avail_below {
-                break;
-            }
-            below_rows.push(r);
-        }
-    }
-
-    let mut all_raw = Vec::with_capacity(h);
-    for _ in 0..avail_above.saturating_sub(above_rows.len()) {
-        all_raw.push(RawRow::Blank);
-    }
-    all_raw.extend(above_rows);
-    all_raw.extend(center_rows);
-    all_raw.extend(below_rows);
-
-    let mut out: Vec<Line<'static>> = Vec::with_capacity(h);
-    let mut row_map: Vec<(u16, usize, f64)> = Vec::new();
-    let mut help_btns: Vec<(Rect, usize)> = Vec::new();
-    let box_inner_w = lrc_area.width.saturating_sub(2) as usize;
-
-    for raw in all_raw.into_iter().take(h) {
-        let sy = lrc_area.y + 1 + out.len() as u16;
-        match raw {
-            RawRow::Blank => out.push(Line::from("")),
-            RawRow::Bar(bl) => out.push(bl),
-            RawRow::Plain { text, idx, t, color } => {
-                let hovered = mouse_in_lyrics && my == sy;
-                row_map.push((sy, idx, t));
-                if hovered {
-                    let total_chars = text.chars().count() + 4;
-                    let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
-                    let q_x = lrc_area.x + 1 + (left_pad + text.chars().count() + 1) as u16;
-                    let q_rect = Rect::new(q_x, sy, 3, 1);
-                    let q_hov = rect_contains(q_rect, mx, my);
-                    help_btns.push((q_rect, idx));
-                    out.push(Line::from(vec![
-                        Span::styled(
-                            text,
-                            Style::default()
-                                .fg(Color::Rgb(178, 186, 200))
-                                .add_modifier(Modifier::UNDERLINED),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            "[?]",
-                            if q_hov {
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::Yellow)
-                            },
-                        ),
-                    ]));
-                } else {
-                    out.push(Line::from(Span::styled(text, Style::default().fg(color))));
-                }
-            }
-            RawRow::Active {
-                mut spans,
-                idx,
-                t,
-                show_help,
-            } => {
-                row_map.push((sy, idx, t));
-                if show_help {
-                    let text_chars: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                    let total_chars = text_chars + 4;
-                    let left_pad = box_inner_w.saturating_sub(total_chars) / 2;
-                    let q_x = lrc_area.x + 1 + (left_pad + text_chars + 1) as u16;
-                    let q_rect = Rect::new(q_x, sy, 3, 1);
-                    let q_hov = mouse_in_lyrics && rect_contains(q_rect, mx, my);
-                    help_btns.push((q_rect, idx));
-                    spans.push(Span::raw(" "));
-                    spans.push(Span::styled(
-                        "[?]",
-                        if q_hov {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(Color::Rgb(120, 122, 130))
-                        },
-                    ));
-                }
-                out.push(Line::from(spans));
-            }
-        }
-    }
-
-    (out, row_map, help_btns)
+/// Speed and pitch shortcuts.
+fn tune_key(c: char) -> Option<ButtonAction> {
+    Some(match c {
+        '<' => ButtonAction::Speed(false),
+        '>' => ButtonAction::Speed(true),
+        '{' => ButtonAction::Pitch(false),
+        '}' => ButtonAction::Pitch(true),
+        't' => ButtonAction::ToggleTuneLink,
+        '0' => ButtonAction::ResetTune,
+        _ => return None,
+    })
 }
 
 fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
@@ -3184,2080 +2966,14 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(env_max_mb);
+    app.art = Art::detect(app.theme.bg);
 
     loop {
         app.poll_worker();
         app.tick_playback();
 
-        terminal.draw(|f| {
-            app.hits.buttons.clear();
-            app.hits.lyrics_rows.clear();
-            app.hits.lyric_help_btns.clear();
-            app.hits.artist_links.clear();
-            app.hits.album_links.clear();
-            app.hits.dl_play_rows.clear();
-            app.hits.dl_del_btns.clear();
-            app.hits.settings_list = Rect::default();
-            app.hits.lyrics_area = Rect::default();
-            app.hits.dl_dropdown = Rect::default();
-            app.hits.popup_rect = Rect::default();
-
-            let outer = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // 0: Top Bar ([ itmp ] | Search | [ Search ] | [ v DL ] | [ Settings ])
-                    Constraint::Min(10),   // 1: Body: Library+Cover | Main View | Live Lyrics
-                    Constraint::Length(3), // 2: Now Playing progress + time left
-                    Constraint::Length(3), // 3: Controls bar
-                ])
-                .split(f.area());
-
-            // 1. Spotify-style Top Navigation Bar
-            let top_cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(10), // [ itmp ]
-                    Constraint::Min(18),    // Search input
-                    Constraint::Length(11), // [ Search ]
-                    Constraint::Length(10), // [ v DL ]
-                    Constraint::Length(13), // [ Settings ]
-                ])
-                .split(outer[0]);
-
-            let home_active = matches!(
-                app.view,
-                View::AllTracks | View::Liked | View::Queue | View::Playlist(_)
-            );
-            let home_btn = Paragraph::new(" itmp ")
-                .alignment(Alignment::Center)
-                .style(if home_active {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(if home_active {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
-                );
-            app.hits.buttons.push((top_cols[0], ButtonAction::Home));
-            f.render_widget(home_btn, top_cols[0]);
-
-            // Top Search input box
-            app.hits.search_box = top_cols[1];
-            let is_searching = matches!(app.input_mode, InputMode::Search);
-            let (search_text, search_style, search_border) = if is_searching {
-                (
-                    format!(" / {}_", app.input_buf),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::Green),
-                )
-            } else if !app.last_search_query.is_empty() && matches!(app.view, View::Search) {
-                (
-                    format!(" / {}", app.last_search_query),
-                    Style::default().fg(Color::White),
-                    Style::default().fg(Color::Green),
-                )
-            } else {
-                (
-                    " / Search songs, albums, artists, or paste Spotify/YouTube URL...".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::DarkGray),
-                )
-            };
-            let search_box = Paragraph::new(search_text).style(search_style).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(search_border),
-            );
-            f.render_widget(search_box, top_cols[1]);
-
-            // Top [ Search ] button
-            let search_btn_active = is_searching || matches!(app.view, View::Search);
-            let search_btn = Paragraph::new(" Search ")
-                .alignment(Alignment::Center)
-                .style(if search_btn_active {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(if search_btn_active {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
-                );
-            app.hits.buttons.push((top_cols[2], ButtonAction::SearchBtn));
-            f.render_widget(search_btn, top_cols[2]);
-
-            // Top [ v DL ] Downloads dropdown button right next to Search
-            app.hits.dl_btn = top_cols[3];
-            let dl_label = if app.busy { " * DL " } else { " v DL " };
-            let dl_btn = Paragraph::new(dl_label)
-                .alignment(Alignment::Center)
-                .style(if app.show_downloads_menu {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else if app.busy {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Cyan)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(if app.show_downloads_menu {
-                            Style::default().fg(Color::Cyan)
-                        } else if app.busy {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
-                );
-            app.hits.buttons.push((top_cols[3], ButtonAction::ToggleDownloads));
-            f.render_widget(dl_btn, top_cols[3]);
-
-            // Top [ Settings ] button
-            let settings_active = matches!(app.view, View::Settings);
-            let settings_btn = Paragraph::new(" Settings ")
-                .alignment(Alignment::Center)
-                .style(if settings_active {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(if settings_active {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }),
-                );
-            app.hits.buttons.push((top_cols[4], ButtonAction::Settings));
-            f.render_widget(settings_btn, top_cols[4]);
-
-            // 2. Body split
-            let body = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(24), Constraint::Min(30)])
-                .split(outer[1]);
-
-            let left = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(6), Constraint::Length(12)])
-                .split(body[0]);
-
-            app.hits.sidebar = left[0];
-
-            // Clean Spotify-style Library Sidebar (Tracks, Liked, Queue, Liked Artists, Playlists)
-            let sb_rows = app.sidebar_rows();
-            let sb_items: Vec<ListItem> = sb_rows
-                .iter()
-                .map(|(label, entry)| match entry {
-                    SidebarEntry::Header => ListItem::new(Span::styled(
-                        label.clone(),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    SidebarEntry::Artist(_) => ListItem::new(Span::styled(
-                        label.clone(),
-                        Style::default().fg(Color::Cyan),
-                    )),
-                    SidebarEntry::NewPlaylist => ListItem::new(Span::styled(
-                        label.clone(),
-                        Style::default().fg(Color::Green),
-                    )),
-                    _ => ListItem::new(label.clone()),
-                })
-                .collect();
-            let sb_border = if app.focus == Focus::Sidebar {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let sb_list = List::new(sb_items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(sb_border)
-                        .title(" Library "),
-                )
-                .highlight_style(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("> ");
-            f.render_stateful_widget(sb_list, left[0], &mut app.sidebar_state);
-
-            // Album Cover Box (bottom-left)
-            let cov_inner_w = left[1].width.saturating_sub(2);
-            let cov_inner_h = left[1].height.saturating_sub(2);
-            app.ensure_cover_art(cov_inner_w, cov_inner_h);
-            let cov_title = app
-                .current_track_entry()
-                .map(|e| {
-                    if !e.album.is_empty() {
-                        format!(" {} ", e.album)
-                    } else {
-                        " Cover ".to_string()
-                    }
-                })
-                .unwrap_or_else(|| " Cover ".to_string());
-            let cov_widget = if let Some(art) = &app.cover_art {
-                Paragraph::new(art.lines.clone())
-                    .alignment(Alignment::Center)
-                    .block(Block::default().borders(Borders::ALL).title(cov_title))
-            } else {
-                Paragraph::new("\n\n  No Cover")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(Block::default().borders(Borders::ALL).title(cov_title))
-            };
-            f.render_widget(cov_widget, left[1]);
-
-            // Right area: Main View + optional Live Lyrics pane
-            let (main_area, lyrics_area_opt) = if app.show_lyrics_pane && !matches!(app.view, View::Settings) {
-                if body[1].width >= 78 {
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(body[1]);
-                    (cols[0], Some(cols[1]))
-                } else {
-                    let rows = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                        .split(body[1]);
-                    (rows[0], Some(rows[1]))
-                }
-            } else {
-                (body[1], None)
-            };
-
-            app.hits.track_list = main_area;
-
-            let main_border = if app.focus == Focus::Main {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            if let InputMode::AddToPlaylist(_) = &app.input_mode {
-                let items: Vec<ListItem> = app
-                    .lib
-                    .playlists
-                    .iter()
-                    .map(|p| ListItem::new(format!("- {} ({})", p.name, p.tracks.len())))
-                    .collect();
-                let list = List::new(items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow))
-                            .title(" Add to Playlist (Enter/Click select, Esc cancel) "),
-                    )
-                    .highlight_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol("+ ");
-                f.render_stateful_widget(list, main_area, &mut app.playlist_pick_state);
-            } else if matches!(app.input_mode, InputMode::SearchResults) || matches!(app.view, View::Search) {
-                let search_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(6)])
-                    .split(main_area);
-
-                let songs_n = app.search_results.len();
-                let all_al_n = app.search_albums_list.len();
-                let albums_n = app
-                    .search_albums_list
-                    .iter()
-                    .filter(|a| a.record_type == "album" || a.record_type == "compile")
-                    .count();
-                let eps_n = app
-                    .search_albums_list
-                    .iter()
-                    .filter(|a| a.record_type == "ep")
-                    .count();
-                let singles_n = app
-                    .search_albums_list
-                    .iter()
-                    .filter(|a| a.record_type == "single")
-                    .count();
-
-                let wide_tabs = search_rows[0].width >= 72;
-                let s_tab_style = |tab: SearchTab, cnt: usize| {
-                    if app.search_tab == tab {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
-                    } else if cnt > 0 {
-                        Style::default().fg(Color::Rgb(218, 222, 230))
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    }
-                };
-                let s_tab_lbl = |name: &str, cnt: usize| {
-                    if wide_tabs {
-                        format!("[ {name} ({cnt}) ]")
-                    } else {
-                        format!("[ {name} ]")
-                    }
-                };
-                let s_tab_line = render_inline_buttons(
-                    vec![
-                        (
-                            s_tab_lbl("Songs", songs_n),
-                            s_tab_style(SearchTab::Songs, songs_n),
-                            Some(ButtonAction::SearchTab(SearchTab::Songs)),
-                        ),
-                        (
-                            s_tab_lbl("All", all_al_n),
-                            s_tab_style(SearchTab::AllReleases, all_al_n),
-                            Some(ButtonAction::SearchTab(SearchTab::AllReleases)),
-                        ),
-                        (
-                            s_tab_lbl("Albums", albums_n),
-                            s_tab_style(SearchTab::Albums, albums_n),
-                            Some(ButtonAction::SearchTab(SearchTab::Albums)),
-                        ),
-                        (
-                            s_tab_lbl("EPs", eps_n),
-                            s_tab_style(SearchTab::Eps, eps_n),
-                            Some(ButtonAction::SearchTab(SearchTab::Eps)),
-                        ),
-                        (
-                            s_tab_lbl("Singles", singles_n),
-                            s_tab_style(SearchTab::Singles, singles_n),
-                            Some(ButtonAction::SearchTab(SearchTab::Singles)),
-                        ),
-                    ],
-                    search_rows[0],
-                    1,
-                    &mut app.hits.buttons,
-                );
-                let s_tab_bar = Paragraph::new(s_tab_line).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title(" Filter "),
-                );
-                f.render_widget(s_tab_bar, search_rows[0]);
-
-                let list_area = search_rows[1];
-                app.hits.track_list = list_area;
-
-                if app.search_tab == SearchTab::Songs {
-                    if app.search_results.is_empty() {
-                        let msg = if app.busy {
-                            format!("\n  Searching for '{}'...", app.last_search_query)
-                        } else {
-                            "\n  Search for songs, albums, EPs, artists, or paste a Spotify / YouTube URL above."
-                                .to_string()
-                        };
-                        let empty_search = Paragraph::new(msg)
-                            .style(Style::default().fg(if app.busy { Color::Yellow } else { Color::Gray }))
-                            .wrap(Wrap { trim: false })
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::Green))
-                                    .title(" Search "),
-                            );
-                        f.render_widget(empty_search, list_area);
-                    } else {
-                        let title_max = list_area.width.saturating_sub(28).clamp(16, 48) as usize;
-                        let scroll_off = app.search_state.offset();
-                        let (mx, my) = app.mouse_pos;
-                        let max_y = list_area.y + list_area.height.saturating_sub(1);
-                        let items: Vec<ListItem> = app
-                            .search_results
-                            .iter()
-                            .enumerate()
-                            .map(|(i, r)| {
-                                let thumb_key = format!("yt:{}", r.id);
-                                let thumb_rows = app.thumbs.get_by_key(&thumb_key).cloned();
-                                let downloaded = find_cached_track(&app.lib, &r.title, &r.uploader).is_some();
-
-                                let mut l1: Vec<Span<'static>> = Vec::new();
-                                let mut l2: Vec<Span<'static>> = Vec::new();
-                                if let Some([t0, t1]) = thumb_rows {
-                                    l1.extend(t0);
-                                    l2.extend(t1);
-                                } else {
-                                    l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                    l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                }
-                                l1.push(Span::raw(" "));
-                                l2.push(Span::raw(" "));
-
-                                let mut t_disp = r.title.clone();
-                                if t_disp.chars().count() > title_max {
-                                    t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                                }
-                                l1.push(Span::styled(
-                                    format!("[{:>5}] ", r.duration),
-                                    Style::default().fg(Color::Rgb(118, 238, 148)),
-                                ));
-                                l1.push(Span::styled(
-                                    t_disp,
-                                    Style::default()
-                                        .fg(Color::Rgb(244, 244, 246))
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                                if downloaded {
-                                    l1.push(Span::styled(
-                                        " [DOWNLOADED]",
-                                        Style::default().fg(Color::Rgb(118, 238, 148)),
-                                    ));
-                                }
-
-                                l2.push(Span::styled("        ", Style::default()));
-                                let mut artist_style = Style::default().fg(Color::Cyan);
-                                if i >= scroll_off {
-                                    let row_y2 = list_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
-                                    if row_y2 < max_y && !r.uploader.is_empty() {
-                                        // border(1) + highlight(2) + thumb(4) + space(1) + indent(8) = +16
-                                        let ax = list_area.x + 16;
-                                        let aw = (r.uploader.chars().count() as u16)
-                                            .min(list_area.width.saturating_sub(18));
-                                        let arect = Rect::new(ax, row_y2, aw, 1);
-                                        if rect_contains(arect, mx, my) {
-                                            artist_style = artist_style.add_modifier(Modifier::UNDERLINED);
-                                        }
-                                        app.hits.artist_links.push((arect, r.uploader.clone()));
-                                    }
-                                }
-                                l2.push(Span::styled(r.uploader.clone(), artist_style));
-
-                                ListItem::new(vec![Line::from(l1), Line::from(l2)])
-                            })
-                            .collect();
-                        let list = List::new(items)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::Green))
-                                    .title(format!(" Songs ({}) ", app.search_results.len())),
-                            )
-                            .highlight_style(
-                                Style::default()
-                                    .bg(Color::Rgb(46, 52, 62))
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                            .highlight_symbol("| ");
-                        f.render_stateful_widget(list, list_area, &mut app.search_state);
-                    }
-                } else {
-                    let filtered = app.filtered_search_albums();
-                    let tab_title = match app.search_tab {
-                        SearchTab::AllReleases => format!(" All Releases ({}) ", filtered.len()),
-                        SearchTab::Albums => format!(" Albums ({}) ", filtered.len()),
-                        SearchTab::Eps => format!(" EPs ({}) ", filtered.len()),
-                        SearchTab::Singles => format!(" Singles ({}) ", filtered.len()),
-                        SearchTab::Songs => " Releases ".into(),
-                    };
-                    if filtered.is_empty() {
-                        let msg = if app.busy {
-                            format!("\n  Searching releases for '{}'...", app.last_search_query)
-                        } else if app.last_search_query.is_empty() {
-                            "\n  Search for an artist or album name above to browse Albums, EPs & Singles.".into()
-                        } else {
-                            format!("\n  No matching releases in this category for '{}'.", app.last_search_query)
-                        };
-                        let empty = Paragraph::new(msg)
-                            .style(Style::default().fg(if app.busy { Color::Yellow } else { Color::Gray }))
-                            .wrap(Wrap { trim: false })
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::Green))
-                                    .title(tab_title),
-                            );
-                        f.render_widget(empty, list_area);
-                    } else {
-                        let title_max = list_area.width.saturating_sub(26).clamp(16, 48) as usize;
-                        let scroll_off = app.search_album_state.offset();
-                        let (mx, my) = app.mouse_pos;
-                        let max_y = list_area.y + list_area.height.saturating_sub(1);
-                        let items: Vec<ListItem> = filtered
-                            .iter()
-                            .enumerate()
-                            .map(|(i, al)| {
-                                let thumb_rows = al
-                                    .cover_url
-                                    .as_ref()
-                                    .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
-                                    .cloned();
-                                let mut l1: Vec<Span<'static>> = Vec::new();
-                                let mut l2: Vec<Span<'static>> = Vec::new();
-                                if let Some([t0, t1]) = thumb_rows {
-                                    l1.extend(t0);
-                                    l2.extend(t1);
-                                } else {
-                                    l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                    l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                }
-                                l1.push(Span::raw(" "));
-                                l2.push(Span::raw(" "));
-
-                                let badge_color = match al.record_type.as_str() {
-                                    "ep" => Color::Cyan,
-                                    "single" => Color::Rgb(118, 238, 148),
-                                    "compile" => Color::Magenta,
-                                    _ => Color::Yellow,
-                                };
-                                let badge = format!("[{}] ", al.type_badge());
-                                let mut t_disp = al.title.clone();
-                                if t_disp.chars().count() > title_max {
-                                    t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                                }
-                                l1.push(Span::styled(badge, Style::default().fg(badge_color)));
-                                l1.push(Span::styled(
-                                    t_disp,
-                                    Style::default()
-                                        .fg(Color::Rgb(244, 244, 246))
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-
-                                let mut cur_x = list_area.x + 8; // border(1) + highlight(2) + thumb(4) + space(1)
-                                let row_y2_opt = if i >= scroll_off {
-                                    let y2 = list_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
-                                    (y2 < max_y).then_some(y2)
-                                } else {
-                                    None
-                                };
-                                if !al.artist.is_empty() {
-                                    let mut a_style = Style::default().fg(Color::Cyan);
-                                    let a_len = al.artist.chars().count() as u16;
-                                    if let Some(y2) = row_y2_opt {
-                                        let arect = Rect::new(cur_x, y2, a_len, 1);
-                                        if rect_contains(arect, mx, my) {
-                                            a_style = a_style.add_modifier(Modifier::UNDERLINED);
-                                        }
-                                        app.hits.artist_links.push((arect, al.artist.clone()));
-                                    }
-                                    l2.push(Span::styled(al.artist.clone(), a_style));
-                                    cur_x += a_len;
-                                }
-                                let mut meta = String::new();
-                                if !al.release_year.is_empty() {
-                                    meta.push_str(&format!(" | {}", al.release_year));
-                                }
-                                if al.track_count > 0 {
-                                    let unit = if al.track_count == 1 { "track" } else { "tracks" };
-                                    meta.push_str(&format!(" | {} {unit}", al.track_count));
-                                }
-                                if !meta.is_empty() {
-                                    let _ = cur_x;
-                                    l2.push(Span::styled(meta, Style::default().fg(Color::Rgb(150, 155, 165))));
-                                }
-                                ListItem::new(vec![Line::from(l1), Line::from(l2)])
-                            })
-                            .collect();
-                        let list = List::new(items)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::Green))
-                                    .title(tab_title),
-                            )
-                            .highlight_style(
-                                Style::default()
-                                    .bg(Color::Rgb(46, 52, 62))
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                            .highlight_symbol("| ");
-                        f.render_stateful_widget(list, list_area, &mut app.search_album_state);
-                    }
-                }
-            } else if matches!(app.view, View::Artist) {
-                let artist_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(9), Constraint::Length(3), Constraint::Min(6)])
-                    .split(main_area);
-
-                // Artist Profile Header (Avatar + Info + Like/Import buttons)
-                let hdr_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(18), Constraint::Min(24)])
-                    .split(artist_rows[0]);
-
-                let av_w = hdr_cols[0].width.saturating_sub(2);
-                let av_h = hdr_cols[0].height.saturating_sub(2);
-                app.ensure_artist_avatar(av_w, av_h);
-                let av_widget = if let Some(art) = &app.artist_avatar_art {
-                    Paragraph::new(art.lines.clone())
-                        .alignment(Alignment::Center)
-                        .block(Block::default().borders(Borders::ALL).title(" Artist "))
-                } else {
-                    Paragraph::new("\n\n  Loading...")
-                        .style(Style::default().fg(Color::DarkGray))
-                        .block(Block::default().borders(Borders::ALL).title(" Artist "))
-                };
-                f.render_widget(av_widget, hdr_cols[0]);
-
-                if let Some(prof) = app.artist_profile.clone() {
-                    let liked = app.is_artist_liked(&prof.name);
-                    let dl_cnt = app
-                        .lib
-                        .entries
-                        .values()
-                        .filter(|e| {
-                            clean_artist_name(&e.artist)
-                                .to_ascii_lowercase()
-                                .contains(&prof.name.to_ascii_lowercase())
-                        })
-                        .count();
-
-                    let info_rows = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(2)])
-                        .split(hdr_cols[1]);
-
-                    let mut meta_lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!(" {}", prof.name),
-                            Style::default().fg(Color::Rgb(245, 245, 248)).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  [{}]", prof.source),
-                            Style::default().fg(Color::Rgb(118, 238, 148)),
-                        ),
-                    ])];
-                    let mut sub = format!(" {} tracks downloaded", dl_cnt);
-                    if let Some(fans) = prof.fans {
-                        sub.push_str(&format!("  |  {}", fmt_fans(fans)));
-                    }
-                    meta_lines.push(Line::from(Span::styled(sub, Style::default().fg(Color::Rgb(165, 170, 180)))));
-                    if let Some(u) = &prof.spotify_url {
-                        meta_lines.push(Line::from(Span::styled(
-                            format!(" {u}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    let info_box = Paragraph::new(meta_lines).block(
-                        Block::default()
-                            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_style(Style::default().fg(Color::Green)),
-                    );
-                    f.render_widget(info_box, info_rows[0]);
-
-                    // Top border is omitted on info_rows[1], so button text sits on row offset 0!
-                    let btn_line = render_inline_buttons(
-                        vec![
-                            (
-                                if liked { "[ * Liked Artist ]".into() } else { "[ + Like Artist ]".into() },
-                                if liked {
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(Color::Yellow)
-                                        .add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                                },
-                                Some(ButtonAction::ToggleLikeArtist),
-                            ),
-                            (
-                                "[ + Import Top Tracks ]".into(),
-                                Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD),
-                                Some(ButtonAction::ArtistImportAll),
-                            ),
-                            (
-                                "[ Back ]".into(),
-                                Style::default().fg(Color::Gray),
-                                Some(ButtonAction::Home),
-                            ),
-                        ],
-                        info_rows[1],
-                        0,
-                        &mut app.hits.buttons,
-                    );
-                    let act_bar = Paragraph::new(btn_line).block(
-                        Block::default()
-                            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                            .border_style(Style::default().fg(Color::Green)),
-                    );
-                    f.render_widget(act_bar, info_rows[1]);
-
-                    // Spotify-style Discography Filter Tabs
-                    let top_n = prof.top_tracks.len();
-                    let all_n = prof.albums.len();
-                    let alb_n = prof
-                        .albums
-                        .iter()
-                        .filter(|a| a.record_type == "album" || a.record_type == "compile")
-                        .count();
-                    let ep_n = prof.albums.iter().filter(|a| a.record_type == "ep").count();
-                    let sng_n = prof.albums.iter().filter(|a| a.record_type == "single").count();
-
-                    let wide_tabs = artist_rows[1].width >= 72;
-                    let a_tab_style = |tab: ArtistTab, cnt: usize| {
-                        if app.artist_tab == tab {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Green)
-                                .add_modifier(Modifier::BOLD)
-                        } else if cnt > 0 {
-                            Style::default().fg(Color::Rgb(218, 222, 230))
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        }
-                    };
-                    let a_tab_lbl = |name: &str, cnt: usize| {
-                        if wide_tabs {
-                            format!("[ {name} ({cnt}) ]")
-                        } else {
-                            format!("[ {name} ]")
-                        }
-                    };
-                    let tab_line = render_inline_buttons(
-                        vec![
-                            (
-                                a_tab_lbl("Top", top_n),
-                                a_tab_style(ArtistTab::TopTracks, top_n),
-                                Some(ButtonAction::ArtistTab(ArtistTab::TopTracks)),
-                            ),
-                            (
-                                a_tab_lbl("All", all_n),
-                                a_tab_style(ArtistTab::All, all_n),
-                                Some(ButtonAction::ArtistTab(ArtistTab::All)),
-                            ),
-                            (
-                                a_tab_lbl("Albums", alb_n),
-                                a_tab_style(ArtistTab::Albums, alb_n),
-                                Some(ButtonAction::ArtistTab(ArtistTab::Albums)),
-                            ),
-                            (
-                                a_tab_lbl("EPs", ep_n),
-                                a_tab_style(ArtistTab::Eps, ep_n),
-                                Some(ButtonAction::ArtistTab(ArtistTab::Eps)),
-                            ),
-                            (
-                                a_tab_lbl("Singles", sng_n),
-                                a_tab_style(ArtistTab::Singles, sng_n),
-                                Some(ButtonAction::ArtistTab(ArtistTab::Singles)),
-                            ),
-                        ],
-                        artist_rows[1],
-                        1,
-                        &mut app.hits.buttons,
-                    );
-                    let tab_bar = Paragraph::new(tab_line).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray))
-                            .title(" Discography "),
-                    );
-                    f.render_widget(tab_bar, artist_rows[1]);
-
-                    let list_area = artist_rows[2];
-                    app.hits.track_list = list_area;
-
-                    if app.artist_tab == ArtistTab::TopTracks {
-                        // Artist Top Tracks (2-line rows with 4x2 album cover art + hover-underlined Artist & Album)
-                        let title_max = list_area.width.saturating_sub(28).clamp(16, 46) as usize;
-                        let scroll_off = app.artist_track_state.offset();
-                        let (mx, my) = app.mouse_pos;
-                        let max_y = list_area.y + list_area.height.saturating_sub(1);
-                        let items: Vec<ListItem> = prof
-                            .top_tracks
-                            .iter()
-                            .enumerate()
-                            .map(|(i, tr)| {
-                                let thumb_rows = tr
-                                    .cover_url
-                                    .as_ref()
-                                    .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
-                                    .cloned();
-                                let downloaded = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
-
-                                let mut l1: Vec<Span<'static>> = Vec::new();
-                                let mut l2: Vec<Span<'static>> = Vec::new();
-                                if let Some([t0, t1]) = thumb_rows {
-                                    l1.extend(t0);
-                                    l2.extend(t1);
-                                } else {
-                                    l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                    l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                }
-                                l1.push(Span::raw(" "));
-                                l2.push(Span::raw(" "));
-
-                                let mut t_disp = tr.title.clone();
-                                if t_disp.chars().count() > title_max {
-                                    t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                                }
-                                l1.push(Span::styled(
-                                    format!("{:>2}. ", i + 1),
-                                    Style::default().fg(Color::Rgb(135, 140, 150)),
-                                ));
-                                l1.push(Span::styled(
-                                    t_disp,
-                                    Style::default()
-                                        .fg(Color::Rgb(244, 244, 246))
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                                if downloaded {
-                                    l1.push(Span::styled(
-                                        " [DOWNLOADED]",
-                                        Style::default().fg(Color::Rgb(118, 238, 148)),
-                                    ));
-                                }
-
-                                let dur = if tr.duration_sec > 0 {
-                                    fmt_time(tr.duration_sec as f64)
-                                } else {
-                                    "--:--".to_string()
-                                };
-                                l2.push(Span::raw("    "));
-                                let row_y2_opt = if i >= scroll_off {
-                                    let y2 = list_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
-                                    (y2 < max_y).then_some(y2)
-                                } else {
-                                    None
-                                };
-                                // border(1) + highlight(2) + thumb(4) + space(1) + indent(4) = +12
-                                let mut cur_x = list_area.x + 12;
-                                let mut a_style = Style::default().fg(Color::Cyan);
-                                let a_len = tr.artist.chars().count() as u16;
-                                if let Some(y2) = row_y2_opt {
-                                    if a_len > 0 {
-                                        let arect = Rect::new(cur_x, y2, a_len, 1);
-                                        if rect_contains(arect, mx, my) {
-                                            a_style = a_style.add_modifier(Modifier::UNDERLINED);
-                                        }
-                                        app.hits.artist_links.push((arect, tr.artist.clone()));
-                                    }
-                                }
-                                l2.push(Span::styled(tr.artist.clone(), a_style));
-                                cur_x += a_len;
-
-                                if !tr.album.is_empty() {
-                                    l2.push(Span::styled(" - ", Style::default().fg(Color::Rgb(135, 140, 150))));
-                                    cur_x += 3;
-                                    let mut al_style = Style::default().fg(Color::Rgb(165, 172, 185));
-                                    let al_len = tr.album.chars().count() as u16;
-                                    if let Some(y2) = row_y2_opt {
-                                        let alrect = Rect::new(cur_x, y2, al_len, 1);
-                                        if rect_contains(alrect, mx, my) {
-                                            al_style = al_style.add_modifier(Modifier::UNDERLINED);
-                                        }
-                                        app.hits.album_links.push((alrect, tr.artist.clone(), tr.album.clone()));
-                                    }
-                                    l2.push(Span::styled(tr.album.clone(), al_style));
-                                }
-                                l2.push(Span::styled(
-                                    format!(" | {dur}"),
-                                    Style::default().fg(Color::Rgb(135, 140, 150)),
-                                ));
-
-                                ListItem::new(vec![Line::from(l1), Line::from(l2)])
-                            })
-                            .collect();
-
-                        let list = List::new(items)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .border_style(main_border)
-                                    .title(format!(" Top Tracks ({}) ", prof.top_tracks.len())),
-                            )
-                            .highlight_style(
-                                Style::default()
-                                    .bg(Color::Rgb(46, 52, 62))
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                            .highlight_symbol("| ");
-                        f.render_stateful_widget(list, list_area, &mut app.artist_track_state);
-                    } else {
-                        let filtered = app.filtered_artist_albums();
-                        let disc_title = match app.artist_tab {
-                            ArtistTab::All => format!(" All Releases ({}) ", filtered.len()),
-                            ArtistTab::Albums => format!(" Albums ({}) ", filtered.len()),
-                            ArtistTab::Eps => format!(" EPs ({}) ", filtered.len()),
-                            ArtistTab::Singles => format!(" Singles ({}) ", filtered.len()),
-                            ArtistTab::TopTracks => " Top Tracks ".into(),
-                        };
-                        if filtered.is_empty() {
-                            let p = Paragraph::new("\n  No releases in this category.")
-                                .style(Style::default().fg(Color::Gray))
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .border_style(main_border)
-                                        .title(disc_title),
-                                );
-                            f.render_widget(p, list_area);
-                        } else {
-                            let title_max = list_area.width.saturating_sub(24).clamp(16, 48) as usize;
-                            let items: Vec<ListItem> = filtered
-                                .iter()
-                                .map(|al| {
-                                    let thumb_rows = al
-                                        .cover_url
-                                        .as_ref()
-                                        .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
-                                        .cloned();
-                                    let mut l1: Vec<Span<'static>> = Vec::new();
-                                    let mut l2: Vec<Span<'static>> = Vec::new();
-                                    if let Some([t0, t1]) = thumb_rows {
-                                        l1.extend(t0);
-                                        l2.extend(t1);
-                                    } else {
-                                        l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                        l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                    }
-                                    l1.push(Span::raw(" "));
-                                    l2.push(Span::raw(" "));
-
-                                    let badge_color = match al.record_type.as_str() {
-                                        "ep" => Color::Cyan,
-                                        "single" => Color::Rgb(118, 238, 148),
-                                        "compile" => Color::Magenta,
-                                        _ => Color::Yellow,
-                                    };
-                                    let mut t_disp = al.title.clone();
-                                    if t_disp.chars().count() > title_max {
-                                        t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                                    }
-                                    l1.push(Span::styled(
-                                        format!("[{}] ", al.type_badge()),
-                                        Style::default().fg(badge_color),
-                                    ));
-                                    l1.push(Span::styled(
-                                        t_disp,
-                                        Style::default()
-                                            .fg(Color::Rgb(244, 244, 246))
-                                            .add_modifier(Modifier::BOLD),
-                                    ));
-
-                                    let mut sub = if al.release_year.is_empty() {
-                                        al.type_badge().to_string()
-                                    } else {
-                                        format!("{} | {}", al.release_year, al.type_badge())
-                                    };
-                                    if al.track_count > 0 {
-                                        let unit = if al.track_count == 1 { "track" } else { "tracks" };
-                                        sub.push_str(&format!(" | {} {unit}", al.track_count));
-                                    }
-                                    l2.push(Span::styled(sub, Style::default().fg(Color::Rgb(155, 160, 170))));
-                                    ListItem::new(vec![Line::from(l1), Line::from(l2)])
-                                })
-                                .collect();
-                            let list = List::new(items)
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .border_style(main_border)
-                                        .title(disc_title),
-                                )
-                                .highlight_style(
-                                    Style::default()
-                                        .bg(Color::Rgb(46, 52, 62))
-                                        .add_modifier(Modifier::BOLD),
-                                )
-                                .highlight_symbol("| ");
-                            f.render_stateful_widget(list, list_area, &mut app.artist_album_state);
-                        }
-                    }
-                } else {
-                    let loading_msg = app
-                        .artist_loading_name
-                        .as_deref()
-                        .map(|n| format!("\n  Loading profile for '{n}'..."))
-                        .unwrap_or_else(|| "\n  Select an artist to view their profile.".into());
-                    let p = Paragraph::new(loading_msg)
-                        .style(Style::default().fg(Color::Yellow))
-                        .block(Block::default().borders(Borders::ALL).title(" Artist Profile "));
-                    f.render_widget(p, hdr_cols[1]);
-                }
-            } else if matches!(app.view, View::Album) {
-                let album_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(9), Constraint::Min(6)])
-                    .split(main_area);
-
-                let hdr_cols = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(18), Constraint::Min(24)])
-                    .split(album_rows[0]);
-
-                let cov_w = hdr_cols[0].width.saturating_sub(2);
-                let cov_h = hdr_cols[0].height.saturating_sub(2);
-                app.ensure_album_cover(cov_w, cov_h);
-                let cov_widget = if let Some(art) = &app.album_cover_art {
-                    Paragraph::new(art.lines.clone())
-                        .alignment(Alignment::Center)
-                        .block(Block::default().borders(Borders::ALL).title(" Cover "))
-                } else {
-                    Paragraph::new("\n\n  Loading...")
-                        .style(Style::default().fg(Color::DarkGray))
-                        .block(Block::default().borders(Borders::ALL).title(" Cover "))
-                };
-                f.render_widget(cov_widget, hdr_cols[0]);
-
-                if let Some(det) = app.album_detail.clone() {
-                    let dl_cnt = det
-                        .tracks
-                        .iter()
-                        .filter(|t| find_cached_track(&app.lib, &t.title, &t.artist).is_some())
-                        .count();
-
-                    let info_rows = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(2)])
-                        .split(hdr_cols[1]);
-
-                    let badge_color = match det.record_type.as_str() {
-                        "ep" => Color::Cyan,
-                        "single" => Color::Rgb(118, 238, 148),
-                        "compile" => Color::Magenta,
-                        _ => Color::Yellow,
-                    };
-                    let mut meta_lines = vec![Line::from(vec![
-                        Span::styled(
-                            format!(" {}", det.title),
-                            Style::default().fg(Color::Rgb(245, 245, 248)).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  [{}]", det.type_badge()),
-                            Style::default().fg(badge_color),
-                        ),
-                    ])];
-                    let mut sub = format!(" {}", det.artist);
-                    if !det.release_date.is_empty() {
-                        sub.push_str(&format!("  |  {}", det.release_date));
-                    }
-                    sub.push_str(&format!("  |  {} tracks", det.tracks.len()));
-                    meta_lines.push(Line::from(Span::styled(sub, Style::default().fg(Color::Cyan))));
-                    meta_lines.push(Line::from(Span::styled(
-                        format!(" {} / {} downloaded", dl_cnt, det.tracks.len()),
-                        Style::default().fg(Color::Rgb(165, 170, 180)),
-                    )));
-                    let info_box = Paragraph::new(meta_lines).block(
-                        Block::default()
-                            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                            .border_style(Style::default().fg(Color::Green)),
-                    );
-                    f.render_widget(info_box, info_rows[0]);
-
-                    let btn_line = render_inline_buttons(
-                        vec![
-                            (
-                                format!("[ Artist: {} ]", det.artist),
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                                Some(ButtonAction::OpenAlbumArtist),
-                            ),
-                            (
-                                "[ + Import Album ]".into(),
-                                Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD),
-                                Some(ButtonAction::AlbumImportAll),
-                            ),
-                            (
-                                "[ Back ]".into(),
-                                Style::default().fg(Color::Gray),
-                                Some(ButtonAction::AlbumBack),
-                            ),
-                        ],
-                        info_rows[1],
-                        0,
-                        &mut app.hits.buttons,
-                    );
-                    let act_bar = Paragraph::new(btn_line).block(
-                        Block::default()
-                            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
-                            .border_style(Style::default().fg(Color::Green)),
-                    );
-                    f.render_widget(act_bar, info_rows[1]);
-
-                    let list_area = album_rows[1];
-                    app.hits.track_list = list_area;
-                    let title_max = list_area.width.saturating_sub(28).clamp(16, 46) as usize;
-                    let scroll_off = app.album_track_state.offset();
-                    let (mx, my) = app.mouse_pos;
-                    let max_y = list_area.y + list_area.height.saturating_sub(1);
-                    let album_thumb = det
-                        .cover_url
-                        .as_ref()
-                        .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
-                        .cloned();
-                    let items: Vec<ListItem> = det
-                        .tracks
-                        .iter()
-                        .enumerate()
-                        .map(|(i, tr)| {
-                            let downloaded = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
-                            let mut l1: Vec<Span<'static>> = Vec::new();
-                            let mut l2: Vec<Span<'static>> = Vec::new();
-                            if let Some([t0, t1]) = album_thumb.clone() {
-                                l1.extend(t0);
-                                l2.extend(t1);
-                            } else {
-                                l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                                l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                            }
-                            l1.push(Span::raw(" "));
-                            l2.push(Span::raw(" "));
-
-                            let mut t_disp = tr.title.clone();
-                            if t_disp.chars().count() > title_max {
-                                t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                            }
-                            l1.push(Span::styled(
-                                format!("{:>2}. ", i + 1),
-                                Style::default().fg(Color::Rgb(135, 140, 150)),
-                            ));
-                            l1.push(Span::styled(
-                                t_disp,
-                                Style::default()
-                                    .fg(Color::Rgb(244, 244, 246))
-                                    .add_modifier(Modifier::BOLD),
-                            ));
-                            if downloaded {
-                                l1.push(Span::styled(
-                                    " [DOWNLOADED]",
-                                    Style::default().fg(Color::Rgb(118, 238, 148)),
-                                ));
-                            }
-
-                            let dur = if tr.duration_sec > 0 {
-                                fmt_time(tr.duration_sec as f64)
-                            } else {
-                                "--:--".to_string()
-                            };
-                            l2.push(Span::raw("    "));
-                            let row_y2_opt = if i >= scroll_off {
-                                let y2 = list_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
-                                (y2 < max_y).then_some(y2)
-                            } else {
-                                None
-                            };
-                            let cur_x = list_area.x + 12;
-                            let mut a_style = Style::default().fg(Color::Cyan);
-                            let a_len = tr.artist.chars().count() as u16;
-                            if let Some(y2) = row_y2_opt {
-                                if a_len > 0 {
-                                    let arect = Rect::new(cur_x, y2, a_len, 1);
-                                    if rect_contains(arect, mx, my) {
-                                        a_style = a_style.add_modifier(Modifier::UNDERLINED);
-                                    }
-                                    app.hits.artist_links.push((arect, tr.artist.clone()));
-                                }
-                            }
-                            l2.push(Span::styled(tr.artist.clone(), a_style));
-                            l2.push(Span::styled(
-                                format!(" | {dur}"),
-                                Style::default().fg(Color::Rgb(135, 140, 150)),
-                            ));
-                            ListItem::new(vec![Line::from(l1), Line::from(l2)])
-                        })
-                        .collect();
-
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(main_border)
-                                .title(format!(" Tracklist ({}) ", det.tracks.len())),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Rgb(46, 52, 62))
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("| ");
-                    f.render_stateful_widget(list, list_area, &mut app.album_track_state);
-                } else {
-                    let loading_msg = app
-                        .album_loading_name
-                        .as_deref()
-                        .map(|n| format!("\n  Loading '{n}'..."))
-                        .unwrap_or_else(|| "\n  Select an album to view its tracks.".into());
-                    let p = Paragraph::new(loading_msg)
-                        .style(Style::default().fg(Color::Yellow))
-                        .block(Block::default().borders(Borders::ALL).title(" Album "));
-                    f.render_widget(p, hdr_cols[1]);
-                }
-            } else if matches!(app.view, View::Settings) {
-                // Settings split: Left = Cache + Spotify Linking | Right = Keybinds reference
-                let (settings_left, keybinds_opt) = if main_area.width >= 82 {
-                    let cols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                        .split(main_area);
-                    (cols[0], Some(cols[1]))
-                } else {
-                    (main_area, None)
-                };
-
-                let s_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(8), Constraint::Min(10)])
-                    .split(settings_left);
-
-                // Section 1: Audio Cache Settings
-                let cache_inner = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Length(2), Constraint::Length(3)])
-                    .split(s_rows[0]);
-
-                let used = total_cache_bytes(&app.lib);
-                let ratio = ((used as f64) / (app.max_bytes.max(1) as f64)).clamp(0.0, 1.0);
-                let cache_label = format!(
-                    "{} / {} ({} tracks, {} liked)",
-                    fmt_mb(used),
-                    fmt_mb(app.max_bytes),
-                    app.lib.entries.len(),
-                    app.lib.entries.values().filter(|e| e.liked).count()
-                );
-                let gauge = Gauge::default()
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow))
-                            .title(" Audio Cache "),
-                    )
-                    .gauge_style(Style::default().fg(Color::Rgb(68, 152, 92)).bg(Color::Rgb(36, 38, 44)))
-                    .ratio(ratio)
-                    .label(Span::styled(
-                        cache_label,
-                        Style::default().fg(Color::Rgb(245, 245, 248)).add_modifier(Modifier::BOLD),
-                    ));
-                f.render_widget(gauge, cache_inner[0]);
-
-                let cache_path_p = Paragraph::new(format!(
-                    " Folder: {}  |  Limit: {} MB",
-                    app.dir.display(),
-                    app.max_bytes / 1_048_576
-                ))
-                .style(Style::default().fg(Color::Rgb(165, 170, 180)));
-                f.render_widget(cache_path_p, cache_inner[1]);
-
-                let cache_btns = render_inline_buttons(
-                    vec![
-                        ("[ -100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheDec)),
-                        ("[ +100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheInc)),
-                        (
-                            "[ Prune LRU ]".into(),
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                            Some(ButtonAction::PruneCache),
-                        ),
-                        (
-                            "[ + Import ]".into(),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                            Some(ButtonAction::Import),
-                        ),
-                    ],
-                    cache_inner[2],
-                    1,
-                    &mut app.hits.buttons,
-                );
-                let cache_bar = Paragraph::new(cache_btns)
-                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-                f.render_widget(cache_bar, cache_inner[2]);
-
-                // Section 2: Spotify Linking & Playlist Imports
-                let sp_rows = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(6)])
-                    .split(s_rows[1]);
-
-                let mut sp_btn_defs = vec![(
-                    "[ + Link URL / CSV ]".into(),
-                    Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD),
-                    Some(ButtonAction::SpotifyAddUrl),
-                )];
-                if app.spotify.is_logged_in() {
-                    sp_btn_defs.push((
-                        format!("({})", app.spotify.display_name),
-                        Style::default().fg(Color::Gray),
-                        None,
-                    ));
-                    sp_btn_defs.push((
-                        "[ Refresh ]".into(),
-                        Style::default().fg(Color::White),
-                        Some(ButtonAction::SpotifyRefresh),
-                    ));
-                    sp_btn_defs.push((
-                        "[ Logout ]".into(),
-                        Style::default().fg(Color::Yellow),
-                        Some(ButtonAction::SpotifyLogout),
-                    ));
-                } else {
-                    sp_btn_defs.push((
-                        "[ OAuth Login ]".into(),
-                        Style::default().fg(Color::Cyan),
-                        Some(ButtonAction::SpotifyLoginPrompt),
-                    ));
-                    sp_btn_defs.push((
-                        "[ Dashboard ]".into(),
-                        Style::default().fg(Color::Gray),
-                        Some(ButtonAction::SpotifyDashboard),
-                    ));
-                }
-                let sp_btn_line = render_inline_buttons(sp_btn_defs, sp_rows[0], 1, &mut app.hits.buttons);
-                let sp_bar = Paragraph::new(sp_btn_line).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Green))
-                        .title(" Spotify Linking "),
-                );
-                f.render_widget(sp_bar, sp_rows[0]);
-
-                app.hits.settings_list = sp_rows[1];
-                if let Some(col) = &app.spotify_open_col {
-                    let items: Vec<ListItem> = app
-                        .spotify_tracks
-                        .iter()
-                        .map(|tr| {
-                            let dur = if tr.duration_sec > 0 {
-                                fmt_time(tr.duration_sec as f64)
-                            } else {
-                                "--:--".to_string()
-                            };
-                            let downloaded = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
-                            let mut spans = vec![
-                                Span::styled(format!("[{:>5}] ", dur), Style::default().fg(Color::Rgb(118, 238, 148))),
-                                Span::styled(format!("{} ", tr.title), Style::default().fg(Color::Rgb(244, 244, 246))),
-                                Span::styled(format!("- {}", tr.artist), Style::default().fg(Color::Cyan)),
-                            ];
-                            if downloaded {
-                                spans.push(Span::styled(
-                                    " [DOWNLOADED]",
-                                    Style::default().fg(Color::Rgb(118, 238, 148)),
-                                ));
-                            }
-                            ListItem::new(Line::from(spans))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Green))
-                                .title(format!(" Spotify: {} ({}) ", col.name, app.spotify_tracks.len())),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Rgb(46, 52, 62))
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("+ ");
-                    f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_track_state);
-                } else if app.spotify_cols.is_empty() {
-                    let help = format!(
-                        "\n  Link any public Spotify playlist or album URL (or Exportify .csv /\n  Spotify .json) using [ + Link URL / CSV ] -- no Premium required.\n\n  For Spotify OAuth (Premium): set Redirect URI to\n  {SPOTIFY_REDIRECT_URI} in Dashboard, then click [ OAuth Login ]."
-                    );
-                    let p = Paragraph::new(help)
-                        .style(Style::default().fg(Color::Rgb(155, 160, 170)))
-                        .wrap(Wrap { trim: false })
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::DarkGray))
-                                .title(" Linked Spotify Playlists "),
-                        );
-                    f.render_widget(p, sp_rows[1]);
-                } else {
-                    let items: Vec<ListItem> = app
-                        .spotify_cols
-                        .iter()
-                        .map(|c| {
-                            ListItem::new(Line::from(vec![
-                                Span::styled(
-                                    format!("{} ", c.name),
-                                    Style::default().fg(Color::Rgb(244, 244, 246)).add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    format!("({}) - {}", c.track_count, c.subtitle),
-                                    Style::default().fg(Color::Rgb(155, 160, 170)),
-                                ),
-                            ]))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Green))
-                                .title(" Linked Spotify Playlists "),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::Rgb(46, 52, 62))
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("> ");
-                    f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_col_state);
-                }
-
-                // Section 3: Keybinds reference inside Settings
-                if let Some(kb_area) = keybinds_opt {
-                    let kb_rows = vec![
-                        ("Playback", None),
-                        ("Space", Some("Play / Pause")),
-                        ("Enter / Click", Some("Play or download song")),
-                        ("n / b", Some("Next / Previous track")),
-                        ("Left / Right", Some("Seek -5s / +5s (or click bar)")),
-                        ("+ / -", Some("Volume up / down")),
-                        ("z / r", Some("Shuffle / Repeat mode")),
-                        ("", None),
-                        ("Navigation & Search", None),
-                        ("/ or s", Some("Focus Search bar")),
-                        ("D", Some("Toggle Downloads dropdown")),
-                        ("A / Click Name", Some("Open Artist Profile")),
-                        ("Click Album", Some("Open Album / EP / Single")),
-                        ("1-5", Some("Switch Discography / Search tabs")),
-                        ("f", Some("Like / Follow Artist")),
-                        ("a", Some("Import All (Album/Artist/Spotify)")),
-                        (", (comma)", Some("Open Settings")),
-                        ("Tab / Esc", Some("Switch pane / Close / Back")),
-                        ("", None),
-                        ("Library & Lyrics", None),
-                        ("Click Lyric", Some("Seek to lyric timestamp")),
-                        ("? / Click [?]", Some("Genius lyric explanation")),
-                        ("l", Some("Like song (pin from cache)")),
-                        ("L", Some("Toggle live lyrics")),
-                        ("[ / ] / \\", Some("Lyrics sync -50ms / +50ms / 0")),
-                        ("d", Some("Download (Search/Artist) / Delete")),
-                        ("Q / N / P", Some("Queue / New / Add to Playlist")),
-                        ("i / p / c", Some("Import / Link Spotify / Prune")),
-                        ("q", Some("Quit itmp")),
-                    ];
-                    let lines: Vec<Line<'static>> = kb_rows
-                        .into_iter()
-                        .map(|(k, desc)| match desc {
-                            None if k.is_empty() => Line::from(""),
-                            None => Line::from(Span::styled(
-                                format!(" {k}"),
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                            )),
-                            Some(d) => Line::from(vec![
-                                Span::styled(
-                                    format!(" {:<15}", k),
-                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(d.to_string(), Style::default().fg(Color::Rgb(185, 190, 200))),
-                            ]),
-                        })
-                        .collect();
-                    let kb_widget = Paragraph::new(lines).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray))
-                            .title(" Keybinds "),
-                    );
-                    f.render_widget(kb_widget, kb_area);
-                }
-            } else {
-                // Library Track Views: All Tracks / Liked Songs / Queue / Playlist
-                let pane_title = match &app.view {
-                    View::AllTracks => format!(" All Tracks ({}) ", app.track_list.len()),
-                    View::Liked => format!(" * Liked Songs ({}) ", app.track_list.len()),
-                    View::Queue => {
-                        let np = app
-                            .current_track_entry()
-                            .map(|e| format!(" | Now: {}", e.title))
-                            .unwrap_or_default();
-                        format!(" Up Next Queue ({}){} ", app.track_list.len(), np)
-                    }
-                    View::Playlist(idx) => app
-                        .lib
-                        .playlists
-                        .get(*idx)
-                        .map(|p| format!(" {} ({}) ", p.name, p.tracks.len()))
-                        .unwrap_or_else(|| " Playlist ".into()),
-                    _ => " Tracks ".into(),
-                };
-
-                let cur_playing = app.player.current_file.clone();
-                let is_paused = app.pb.paused;
-                let row_data: Vec<(String, String, String, String, bool, bool, u64, u64, Option<PathBuf>)> = app
-                    .track_list
-                    .iter()
-                    .filter_map(|fname| {
-                        let e = app.lib.entries.get(fname)?;
-                        Some((
-                            fname.clone(),
-                            e.title.clone(),
-                            clean_artist_name(&e.artist),
-                            e.album.clone(),
-                            e.liked,
-                            has_lrc(&app.dir, fname),
-                            e.duration_sec,
-                            e.size_bytes,
-                            app.cover_path_for(fname),
-                        ))
-                    })
-                    .collect();
-
-                let title_max = main_area.width.saturating_sub(18).clamp(14, 38) as usize;
-                let scroll_off = app.track_state.offset();
-                let (mx, my) = app.mouse_pos;
-                let max_y = main_area.y + main_area.height.saturating_sub(1);
-                let items: Vec<ListItem> = row_data
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (fname, title, artist, album, liked, lrc_ok, dur_sec, size_b, cov_p))| {
-                        let thumb_rows = cov_p
-                            .as_deref()
-                            .and_then(|p| app.thumbs.get_or_load(p))
-                            .cloned();
-
-                        let mut line1_spans: Vec<Span<'static>> = Vec::new();
-                        let mut line2_spans: Vec<Span<'static>> = Vec::new();
-
-                        if let Some([t0, t1]) = thumb_rows {
-                            line1_spans.extend(t0);
-                            line2_spans.extend(t1);
-                        } else {
-                            line1_spans.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                            line2_spans.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
-                        }
-                        line1_spans.push(Span::raw(" "));
-                        line2_spans.push(Span::raw(" "));
-
-                        let is_cur = cur_playing.as_deref() == Some(fname.as_str());
-                        let is_queue_view = matches!(app.view, View::Queue);
-                        let is_manual_queued = is_queue_view && i < app.queue.len();
-                        let status_tag = if is_queue_view {
-                            format!("{:>2}.", i + 1)
-                        } else if is_cur {
-                            if is_paused { "|| ".into() } else { ">  ".into() }
-                        } else if liked {
-                            "*  ".into()
-                        } else {
-                            "   ".into()
-                        };
-                        let tag_style = if is_manual_queued {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else if is_queue_view {
-                            Style::default().fg(Color::Rgb(135, 140, 150))
-                        } else if is_cur {
-                            Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD)
-                        } else if liked {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
-
-                        let mut t_disp = title;
-                        if t_disp.chars().count() > title_max {
-                            t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                        }
-                        line1_spans.push(Span::styled(status_tag, tag_style));
-                        if is_queue_view {
-                            line1_spans.push(Span::raw(" "));
-                        }
-                        line1_spans.push(Span::styled(
-                            t_disp,
-                            if is_cur {
-                                Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::Rgb(244, 244, 246))
-                            },
-                        ));
-                        if is_manual_queued {
-                            line1_spans.push(Span::styled(
-                                " [QUEUED]",
-                                Style::default().fg(Color::Yellow),
-                            ));
-                        }
-
-                        let dur_s = if dur_sec > 0 {
-                            fmt_time(dur_sec as f64)
-                        } else {
-                            "--:--".to_string()
-                        };
-                        let lrc_s = if lrc_ok { "LRC" } else { "---" };
-
-                        line2_spans.push(Span::raw("   "));
-                        let row_y2_opt = if i >= scroll_off {
-                            let y2 = main_area.y + 1 + ((i - scroll_off) * 2) as u16 + 1;
-                            (y2 < max_y).then_some(y2)
-                        } else {
-                            None
-                        };
-                        // border(1) + highlight(2) + thumb(4) + space(1) + indent(3) = +11
-                        let mut cur_x = main_area.x + 11;
-
-                        if !artist.is_empty() {
-                            let mut a_style = Style::default().fg(Color::Cyan);
-                            let a_len = artist.chars().count() as u16;
-                            if let Some(y2) = row_y2_opt {
-                                let arect = Rect::new(cur_x, y2, a_len, 1);
-                                if rect_contains(arect, mx, my) {
-                                    a_style = a_style.add_modifier(Modifier::UNDERLINED);
-                                }
-                                app.hits.artist_links.push((arect, artist.clone()));
-                            }
-                            line2_spans.push(Span::styled(artist.clone(), a_style));
-                            cur_x += a_len;
-
-                            if !album.is_empty() {
-                                line2_spans.push(Span::styled(" - ", Style::default().fg(Color::Rgb(140, 145, 155))));
-                                cur_x += 3;
-                                let mut al_style = Style::default().fg(Color::Rgb(165, 172, 185));
-                                let al_len = album.chars().count() as u16;
-                                if let Some(y2) = row_y2_opt {
-                                    let alrect = Rect::new(cur_x, y2, al_len, 1);
-                                    if rect_contains(alrect, mx, my) {
-                                        al_style = al_style.add_modifier(Modifier::UNDERLINED);
-                                    }
-                                    app.hits.album_links.push((alrect, artist.clone(), album.clone()));
-                                }
-                                line2_spans.push(Span::styled(album, al_style));
-                            }
-                            line2_spans.push(Span::styled(
-                                format!(" | {} | {}", dur_s, lrc_s),
-                                Style::default().fg(Color::Rgb(140, 145, 155)),
-                            ));
-                        } else {
-                            line2_spans.push(Span::styled(
-                                format!("{} | {} | {}", dur_s, lrc_s, fmt_mb(size_b)),
-                                Style::default().fg(Color::Rgb(155, 160, 170)),
-                            ));
-                        }
-
-                        ListItem::new(vec![Line::from(line1_spans), Line::from(line2_spans)])
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(main_border)
-                            .title(pane_title),
-                    )
-                    .highlight_style(
-                        Style::default()
-                            .bg(Color::Rgb(46, 52, 62))
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .highlight_symbol("| ");
-                f.render_stateful_widget(list, main_area, &mut app.track_state);
-            }
-
-            // Live Word-by-Word Synced Lyrics panel (hover + click-to-seek + [?] Genius)
-            if let Some(lrc_area) = lyrics_area_opt {
-                app.hits.lyrics_area = lrc_area;
-                let lrc_title = app
-                    .current_track_entry()
-                    .map(|e| {
-                        if e.lrc_offset_ms != 0 {
-                            format!(" Lyrics - {} [{:+.2}s] ", e.title, e.lrc_offset_ms as f64 / 1000.0)
-                        } else {
-                            format!(" Lyrics - {} ", e.title)
-                        }
-                    })
-                    .unwrap_or_else(|| " Lyrics ".to_string());
-                let (lrc_lines, lrc_rows, lrc_helps) = render_word_synced_lyrics(&app, lrc_area);
-                app.hits.lyrics_rows = lrc_rows;
-                app.hits.lyric_help_btns = lrc_helps;
-                let lrc_widget = Paragraph::new(lrc_lines)
-                    .alignment(Alignment::Center)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray))
-                            .title(lrc_title),
-                    );
-                f.render_widget(lrc_widget, lrc_area);
-
-                // Floating [ Return ] button appears right after you scroll away from current lyrics!
-                if app.lyrics_scroll_offset != 0 && lrc_area.width >= 16 && lrc_area.height >= 5 {
-                    let bw = 12u16;
-                    let bx = lrc_area.x + (lrc_area.width.saturating_sub(bw)) / 2;
-                    let by = lrc_area.y + lrc_area.height.saturating_sub(2);
-                    let brect = Rect::new(bx, by, bw, 1);
-                    let hov = rect_contains(brect, app.mouse_pos.0, app.mouse_pos.1);
-                    f.render_widget(Clear, brect);
-                    let ret_btn = Paragraph::new(" [ Return ] ")
-                        .alignment(Alignment::Center)
-                        .style(if hov {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Rgb(118, 238, 148))
-                                .add_modifier(Modifier::BOLD)
-                        });
-                    app.hits.buttons.push((brect, ButtonAction::LyricsReturn));
-                    f.render_widget(ret_btn, brect);
-                }
-            }
-
-            // 3. Now Playing Progress Bar (high-contrast crisp white text!)
-            app.hits.progress_bar = outer[2];
-            let np_ratio = if app.pb.dur > 0.1 {
-                (app.smooth_pos / app.pb.dur).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let np_label = if let Some(e) = app.current_track_entry() {
-                let icon = if app.pb.active && !app.pb.paused { ">" } else { "||" };
-                let liked_mark = if e.liked { " [*]" } else { "" };
-                let artist = if e.artist.is_empty() {
-                    String::new()
-                } else {
-                    format!(" - {}", clean_artist_name(&e.artist))
-                };
-                if app.pb.dur > 0.1 {
-                    let left_sec = (app.pb.dur - app.smooth_pos).max(0.0);
-                    format!(
-                        "{} {}{}{}   {} / {}  (-{} left)",
-                        icon,
-                        e.title,
-                        artist,
-                        liked_mark,
-                        fmt_time(app.smooth_pos),
-                        fmt_time(app.pb.dur),
-                        fmt_time(left_sec),
-                    )
-                } else {
-                    format!("{} {}{}{}   0:00 / --:--", icon, e.title, artist, liked_mark)
-                }
-            } else {
-                "Idle".to_string()
-            };
-            let np_gauge = Gauge::default()
-                .block(Block::default().borders(Borders::ALL).title(" Now Playing "))
-                .gauge_style(
-                    Style::default()
-                        .fg(Color::Rgb(68, 152, 92))
-                        .bg(Color::Rgb(36, 38, 44)),
-                )
-                .ratio(np_ratio)
-                .label(Span::styled(
-                    np_label,
-                    Style::default()
-                        .fg(Color::Rgb(248, 248, 250))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            f.render_widget(np_gauge, outer[2]);
-
-            // 4. Clean Simplistic Clickable Controls Bar
-            app.hits.controls_bar = outer[3];
-            let is_playing = app.pb.active && !app.pb.paused;
-            let cur_liked = app.current_track_entry().map(|e| e.liked).unwrap_or(false);
-
-            let btn_defs: Vec<(String, Style, Option<ButtonAction>)> = vec![
-                ("[ << Prev ]".into(), Style::default().fg(Color::White), Some(ButtonAction::Prev)),
-                (
-                    if is_playing { "[ || Pause ]".into() } else { "[ > Play ]".into() },
-                    if is_playing {
-                        Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                    },
-                    Some(ButtonAction::PlayPause),
-                ),
-                ("[ >> Next ]".into(), Style::default().fg(Color::White), Some(ButtonAction::Next)),
-                (
-                    format!("[ Shuf: {} ]", if app.shuffle { "on" } else { "off" }),
-                    if app.shuffle {
-                        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                    Some(ButtonAction::Shuffle),
-                ),
-                (
-                    format!("[ Rep: {} ]", app.repeat.label()),
-                    if app.repeat != RepeatMode::Off {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                    Some(ButtonAction::Repeat),
-                ),
-                (
-                    if cur_liked { "[ * Liked ]".into() } else { "[ + Like ]".into() },
-                    if cur_liked {
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
-                    Some(ButtonAction::Like),
-                ),
-                (
-                    "[ Artist ]".into(),
-                    Style::default().fg(Color::Cyan),
-                    Some(ButtonAction::OpenCurrentArtist),
-                ),
-                (
-                    "[ Queue ]".into(),
-                    if matches!(app.view, View::Queue) {
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Cyan)
-                    },
-                    Some(ButtonAction::OpenQueue),
-                ),
-                (
-                    format!("[ Lrc: {} ]", if app.show_lyrics_pane { "on" } else { "off" }),
-                    if app.show_lyrics_pane {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                    Some(ButtonAction::ToggleLyrics),
-                ),
-                ("[-]".into(), Style::default().fg(Color::White), Some(ButtonAction::VolDown)),
-                (format!("Vol {}%", app.player.volume), Style::default().fg(Color::Gray), None),
-                ("[+]".into(), Style::default().fg(Color::White), Some(ButtonAction::VolUp)),
-            ];
-
-            let ctrl_line = render_inline_buttons(btn_defs, outer[3], 1, &mut app.hits.buttons);
-            let show_transient = app.busy || (!app.status.is_empty() && app.status_at.elapsed() < Duration::from_secs(4));
-            let ctrl_title = if show_transient {
-                format!(" Controls - {} ", app.status)
-            } else {
-                " Controls ".to_string()
-            };
-            let ctrl_bar = Paragraph::new(ctrl_line)
-                .block(Block::default().borders(Borders::ALL).title(ctrl_title));
-            f.render_widget(ctrl_bar, outer[3]);
-
-            // --- FLOATING OVERLAYS (overlap all UI underneath via Clear) ---
-
-            // Overlay 1: Downloads Dropdown directly under top [ v DL ] button
-            if app.show_downloads_menu {
-                let recent = app.recent_downloaded_tracks(10);
-                let dd_w = 50u16.min(f.area().width.saturating_sub(2));
-                let busy_rows = if app.busy { 2u16 } else { 0 };
-                let dd_h = ((recent.len().max(1) as u16) + busy_rows + 3).min(f.area().height.saturating_sub(4));
-                let dd_x = (top_cols[3].x + top_cols[3].width)
-                    .saturating_sub(dd_w)
-                    .min(f.area().width.saturating_sub(dd_w));
-                let dd_y = outer[0].y + outer[0].height;
-                let dd_rect = Rect::new(dd_x, dd_y, dd_w, dd_h);
-                app.hits.dl_dropdown = dd_rect;
-
-                f.render_widget(Clear, dd_rect);
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                let mut cur_y = dd_rect.y + 1;
-                if app.busy {
-                    lines.push(Line::from(Span::styled(
-                        format!(" > {}", app.status),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    )));
-                    lines.push(Line::from(Span::styled(
-                        "─".repeat(dd_rect.width.saturating_sub(2) as usize),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                    cur_y += 2;
-                }
-                if recent.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        " No downloaded songs yet",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                } else {
-                    let inner_w = dd_rect.width.saturating_sub(2) as usize;
-                    let (mx, my) = app.mouse_pos;
-                    for (fname, title, artist, sz) in recent {
-                        if cur_y >= dd_rect.y + dd_rect.height.saturating_sub(1) {
-                            break;
-                        }
-                        let sz_s = fmt_mb(sz);
-                        let right_part = format!(" {sz_s} [x]");
-                        let max_left = inner_w.saturating_sub(right_part.chars().count() + 1);
-                        let mut label = if artist.is_empty() {
-                            title
-                        } else {
-                            format!("{title} - {artist}")
-                        };
-                        if label.chars().count() > max_left {
-                            label = label
-                                .chars()
-                                .take(max_left.saturating_sub(2))
-                                .collect::<String>()
-                                + "..";
-                        }
-                        let pad = max_left.saturating_sub(label.chars().count());
-                        let del_x = dd_rect.x + 1 + (inner_w.saturating_sub(3)) as u16;
-                        let del_rect = Rect::new(del_x, cur_y, 3, 1);
-                        let play_rect = Rect::new(
-                            dd_rect.x + 1,
-                            cur_y,
-                            dd_rect.width.saturating_sub(5),
-                            1,
-                        );
-                        let row_hov = rect_contains(play_rect, mx, my);
-                        let del_hov = rect_contains(del_rect, mx, my);
-                        app.hits.dl_play_rows.push((play_rect, fname.clone()));
-                        app.hits.dl_del_btns.push((del_rect, fname));
-
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                format!(" {label}{}", " ".repeat(pad)),
-                                if row_hov {
-                                    Style::default()
-                                        .fg(Color::Rgb(118, 238, 148))
-                                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                                } else {
-                                    Style::default().fg(Color::Rgb(235, 237, 242))
-                                },
-                            ),
-                            Span::styled(
-                                format!(" {sz_s} "),
-                                Style::default().fg(Color::Rgb(125, 130, 140)),
-                            ),
-                            Span::styled(
-                                "[x]",
-                                if del_hov {
-                                    Style::default()
-                                        .fg(Color::Black)
-                                        .bg(Color::Red)
-                                        .add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(Color::Red)
-                                },
-                            ),
-                        ]));
-                        cur_y += 1;
-                    }
-                }
-                let dd_widget = Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .style(Style::default().bg(Color::Rgb(20, 22, 26)))
-                        .title(" Recent Downloads "),
-                );
-                f.render_widget(dd_widget, dd_rect);
-            }
-
-            // Overlay 2: Floating Input Modal (only appears when actively entering Import / Playlist / Spotify URL)
-            if matches!(
-                app.input_mode,
-                InputMode::Import
-                    | InputMode::SpotifyClientId
-                    | InputMode::SpotifyAddUrl
-                    | InputMode::NewPlaylist
-            ) {
-                let mw = 68u16.min(f.area().width.saturating_sub(4));
-                let mh = 5u16;
-                let mx = f.area().x + (f.area().width.saturating_sub(mw)) / 2;
-                let my = f.area().y + (f.area().height.saturating_sub(mh)) / 2;
-                let modal_rect = Rect::new(mx, my, mw, mh);
-                f.render_widget(Clear, modal_rect);
-                let (title, prompt, color) = match &app.input_mode {
-                    InputMode::Import => (
-                        " Import Music ",
-                        format!(" URL, Exportify .csv, or path: {}_", app.input_buf),
-                        Color::Cyan,
-                    ),
-                    InputMode::SpotifyClientId => (
-                        " Spotify OAuth Login ",
-                        format!(" Client ID ({SPOTIFY_REDIRECT_URI}): {}_", app.input_buf),
-                        Color::Green,
-                    ),
-                    InputMode::SpotifyAddUrl => (
-                        " Link Spotify Playlist / Album ",
-                        format!(" Spotify URL or .csv/.json path: {}_", app.input_buf),
-                        Color::Green,
-                    ),
-                    InputMode::NewPlaylist => (
-                        " New Playlist ",
-                        format!(" Name: {}_", app.input_buf),
-                        Color::Yellow,
-                    ),
-                    _ => ("", String::new(), Color::White),
-                };
-                let modal = Paragraph::new(vec![Line::from(""), Line::from(prompt)])
-                    .style(Style::default().fg(color).bg(Color::Rgb(20, 22, 26)))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(color))
-                            .title(title),
-                    );
-                f.render_widget(modal, modal_rect);
-            }
-
-            // Overlay 3: Genius Lyric Explanation Popup
-            if let Some(pop) = &app.genius_popup {
-                let pw = 68u16.min(f.area().width.saturating_sub(4));
-                let ph = 18u16.min(f.area().height.saturating_sub(4));
-                let px = f.area().x + (f.area().width.saturating_sub(pw)) / 2;
-                let py = f.area().y + (f.area().height.saturating_sub(ph)) / 2;
-                let prect = Rect::new(px, py, pw, ph);
-                app.hits.popup_rect = prect;
-                f.render_widget(Clear, prect);
-
-                let close_rect = Rect::new(px + pw.saturating_sub(12), py, 10, 1);
-                app.hits.buttons.push((close_rect, ButtonAction::ClosePopup));
-
-                let mut plines = vec![
-                    Line::from(Span::styled(
-                        format!(" \"{}\"", pop.lyric_line),
-                        Style::default()
-                            .fg(Color::Rgb(118, 238, 148))
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                ];
-                if !pop.fragment.is_empty() && pop.fragment != pop.lyric_line {
-                    plines.push(Line::from(Span::styled(
-                        format!(" Genius bar: {}", pop.fragment.replace('\n', " / ")),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                    plines.push(Line::from(""));
-                }
-                for para in pop.explanation.lines() {
-                    plines.push(Line::from(Span::styled(
-                        format!(" {para}"),
-                        Style::default().fg(Color::Rgb(230, 232, 238)),
-                    )));
-                }
-                if !pop.url.is_empty() {
-                    plines.push(Line::from(""));
-                    plines.push(Line::from(Span::styled(
-                        format!(" {}", pop.url),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-
-                let pwidget = Paragraph::new(plines)
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().bg(Color::Rgb(20, 22, 26)))
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow))
-                            .title(format!(" Genius - {} [ Esc / Close ] ", pop.song_title)),
-                    );
-                f.render_widget(pwidget, prect);
-            }
-        })?;
+        terminal.draw(|f| ui::draw(f, &mut app))?;
+        app.art.present(terminal.backend_mut())?;
 
         let poll_ms = if app.pb.active && !app.pb.paused { 16 } else { 45 };
         if event::poll(Duration::from_millis(poll_ms))? {
@@ -5363,11 +3079,12 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 app.input_buf.clear();
                                 app.input_mode = InputMode::Normal;
                                 if !name.is_empty() {
-                                    app.lib.playlists.push(Playlist {
-                                        name: name.clone(),
-                                        tracks: Vec::new(),
+                                    app.edit(|lib| {
+                                        lib.playlists.push(Playlist {
+                                            name: name.clone(),
+                                            tracks: Vec::new(),
+                                        })
                                     });
-                                    save_library(&app.dir, &app.lib);
                                     app.status = format!("Created playlist '{name}'");
                                 }
                             }
@@ -5390,6 +3107,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
                             KeyCode::Char(',') => app.open_settings_view(),
                             KeyCode::Char(' ') => app.trigger_button(ButtonAction::PlayPause),
+                            KeyCode::Char(c) if tune_key(c).is_some() => {
+                                app.trigger_button(tune_key(c).unwrap());
+                            }
                             KeyCode::Char('A') => app.open_selected_or_playing_artist(),
                             KeyCode::Char('1') => app.trigger_button(ButtonAction::SearchTab(SearchTab::Songs)),
                             KeyCode::Char('2') => app.trigger_button(ButtonAction::SearchTab(SearchTab::AllReleases)),
@@ -5429,8 +3149,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                     if let Some(idx) = app.playlist_pick_state.selected() {
                                         if let Some(pl) = app.lib.playlists.get(idx) {
                                             let pl_name = pl.name.clone();
-                                            add_track_to_playlist(&mut app.lib, &pl_name, &fname);
-                                            save_library(&app.dir, &app.lib);
+                                            app.edit(|lib| add_track_to_playlist(lib, &pl_name, &fname));
                                             app.status = format!("Added to playlist '{pl_name}'");
                                         }
                                     }
@@ -5454,6 +3173,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             KeyCode::Right => app.player.seek_rel(5.0),
                             KeyCode::Left => app.player.seek_rel(-5.0),
                             KeyCode::Char(' ') => app.trigger_button(ButtonAction::PlayPause),
+                            KeyCode::Char(c) if tune_key(c).is_some() => {
+                                app.trigger_button(tune_key(c).unwrap());
+                            }
                             KeyCode::Char('n') => app.trigger_button(ButtonAction::Next),
                             KeyCode::Char('b') => app.trigger_button(ButtonAction::Prev),
                             KeyCode::Char('+') | KeyCode::Char('=') => app.trigger_button(ButtonAction::VolUp),
@@ -5461,17 +3183,14 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             KeyCode::Char('z') => app.trigger_button(ButtonAction::Shuffle),
                             KeyCode::Char('r') => app.trigger_button(ButtonAction::Repeat),
                             KeyCode::Char('L') => app.trigger_button(ButtonAction::ToggleLyrics),
+                            KeyCode::Char('S') => app.resync_lyrics(),
                             KeyCode::Char('[') => app.adjust_lrc_offset(Some(-50)),
                             KeyCode::Char(']') => app.adjust_lrc_offset(Some(50)),
                             KeyCode::Char('\\') => app.adjust_lrc_offset(None),
                             KeyCode::Char(',') => app.open_settings_view(),
                             KeyCode::Char('D') => app.trigger_button(ButtonAction::ToggleDownloads),
                             KeyCode::Char('?') => {
-                                let off = app
-                                    .current_track_entry()
-                                    .map(|e| e.lrc_offset_ms as f64 / 1000.0)
-                                    .unwrap_or(0.0);
-                                let pos = app.smooth_pos + off;
+                                let pos = app.lyric_position();
                                 if let Some(idx) = app.lrc_lines.iter().rposition(|l| l.time_sec <= pos) {
                                     app.open_genius_for_lyric(idx);
                                 }
@@ -5518,6 +3237,12 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
                             KeyCode::Char('5') if matches!(app.view, View::Search) => {
                                 app.trigger_button(ButtonAction::SearchTab(SearchTab::Singles));
+                            }
+                            KeyCode::Char('x') if matches!(app.view, View::Settings) => {
+                                app.trigger_button(ButtonAction::ToggleCensor);
+                            }
+                            KeyCode::Char('v') if matches!(app.view, View::Settings) => {
+                                app.trigger_button(ButtonAction::CensorStyle);
                             }
                             KeyCode::Char('p') if matches!(app.view, View::Settings) => {
                                 app.trigger_button(ButtonAction::SpotifyAddUrl);
@@ -5682,30 +3407,20 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                     }
                                 } else if let View::Playlist(idx) = app.view {
                                     if let Some(sel) = app.track_state.selected() {
-                                        if let Some(pl) = app.lib.playlists.get_mut(idx) {
-                                            if sel < pl.tracks.len() {
+                                        let removed = app.edit(|lib| match lib.playlists.get_mut(idx) {
+                                            Some(pl) if sel < pl.tracks.len() => {
                                                 pl.tracks.remove(sel);
-                                                save_library(&app.dir, &app.lib);
-                                                app.rebuild_track_list();
-                                                app.status = "Removed from playlist".into();
+                                                true
                                             }
+                                            _ => false,
+                                        });
+                                        if removed {
+                                            app.rebuild_track_list();
+                                            app.set_notice("Removed from playlist");
                                         }
                                     }
                                 } else if let Some(fname) = app.selected_track() {
-                                    let t = app
-                                        .lib
-                                        .entries
-                                        .get(&fname)
-                                        .map(|e| e.title.clone())
-                                        .unwrap_or_default();
-                                    remove_track_files(&app.dir, &fname);
-                                    app.lib.entries.remove(&fname);
-                                    for pl in &mut app.lib.playlists {
-                                        pl.tracks.retain(|x| x != &fname);
-                                    }
-                                    save_library(&app.dir, &app.lib);
-                                    app.rebuild_track_list();
-                                    app.status = format!("Deleted '{t}' from cache");
+                                    app.delete_track_by_filename(&fname);
                                 }
                             }
                             KeyCode::Char('c') => app.trigger_button(ButtonAction::PruneCache),
@@ -5748,6 +3463,36 @@ fn main() {
     let max_bytes = max_mb * 1_048_576;
 
     match args[0].as_str() {
+        "setup-sync" => {
+            if let Err(e) = sync::setup() {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            println!("Lyric sync is ready. The speech model downloads on first use (~460 MB).");
+        }
+        "sync" => {
+            if !sync::available() {
+                eprintln!("Run `itmp setup-sync` first.");
+                std::process::exit(1);
+            }
+            let lib = load_and_sync_library(&dir);
+            let mut todo: Vec<&String> = lib
+                .entries
+                .keys()
+                .filter(|f| sync::needs_alignment(&dir, f))
+                .collect();
+            todo.sort();
+            for (i, file) in todo.iter().enumerate() {
+                match sync::align(&dir, file) {
+                    Ok((n, total)) => println!("[{}/{}] {file}: {n}/{total} lines", i + 1, todo.len()),
+                    Err(e) => println!("[{}/{}] {file}: {e}", i + 1, todo.len()),
+                }
+            }
+            println!("All lyrics are synced.");
+        }
+        "repair" => {
+            println!("Fixed {} names and covers.", repair::repair_library(&dir));
+        }
         "import" => {
             let raw = args[1..].join(" ");
             if raw.is_empty() {
@@ -5842,13 +3587,15 @@ fn main() {
             } else {
                 match search_youtube(&raw) {
                     Ok(list) if !list.is_empty() => {
-                        for item in &list {
+                        let take = if raw.starts_with("http") { list.len() } else { 1 };
+                        for item in list.iter().take(take) {
+                            let (title, artist) = item.song_name();
                             let url = format!("https://www.youtube.com/watch?v={}", item.id);
                             match download_and_cache_track(
                                 &dir,
                                 &url,
-                                &item.title,
-                                &item.uploader,
+                                &title,
+                                &artist,
                                 "",
                                 Some(&item.thumbnail),
                                 0,
@@ -5880,12 +3627,13 @@ fn main() {
             match search_youtube(&query) {
                 Ok(list) if !list.is_empty() => {
                     let first = &list[0];
+                    let (title, artist) = first.song_name();
                     let url = format!("https://www.youtube.com/watch?v={}", first.id);
                     match download_and_cache_track(
                         &dir,
                         &url,
-                        &first.title,
-                        &first.uploader,
+                        &title,
+                        &artist,
                         "",
                         Some(&first.thumbnail),
                         0,
@@ -5987,6 +3735,9 @@ fn main() {
             println!("  itmp import <spotify|yt|path>    Import from Spotify URL/CSV/JSON, YouTube, or local files/folder");
             println!("  itmp add <query|url>             Download track + cover art + synced lyrics");
             println!("  itmp list                        List cached tracks, covers, lyrics & playlists");
+            println!("  itmp repair                      Restore lost or mangled song names");
+            println!("  itmp setup-sync                  Install word-level lyric sync (local Whisper)");
+            println!("  itmp sync                        Sync lyrics for every downloaded song now");
             println!("  itmp prune                       Prune least-recently-used tracks to <=500 MB");
         }
     }

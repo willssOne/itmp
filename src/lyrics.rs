@@ -17,6 +17,8 @@ pub struct LrcLine {
     pub time_sec: f64,
     pub text: String,
     pub words: Vec<LrcWord>,
+    /// True when the word times were measured from the audio, not estimated.
+    pub aligned: bool,
 }
 
 /// Compact 15ms (~66.7 Hz) Mid-Side vocal-isolated energy & onset envelope (380-2800 Hz).
@@ -698,10 +700,6 @@ pub fn load_lrc(dir: &Path, filename: &str, env: Option<&AudioEnvelope>) -> Vec<
             t_start + 3.5
         };
         let words = build_word_timings(text, t_start, t_end, env);
-        let line_start = words
-            .first()
-            .map(|w| (w.start - 0.06).max(t_start))
-            .unwrap_or(t_start);
         let clean_text = if text.contains('<') && text.contains('>') {
             words
                 .iter()
@@ -712,12 +710,54 @@ pub fn load_lrc(dir: &Path, filename: &str, env: Option<&AudioEnvelope>) -> Vec<
             text.clone()
         };
         out.push(LrcLine {
-            time_sec: line_start,
+            time_sec: t_start,
             text: clean_text,
             words,
+            aligned: false,
         });
     }
+    apply_alignment(&mut out, &crate::sync::words_path(dir, filename));
     out
+}
+
+/// Replaces estimated word times with the measured ones from `<stem>.words.json`.
+fn apply_alignment(lines: &mut [LrcLine], path: &Path) {
+    let Some(doc) = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return;
+    };
+    let Some(measured) = doc["lines"].as_array().filter(|a| !a.is_empty()) else {
+        return;
+    };
+    let offset = doc["offset"].as_f64().unwrap_or(0.0);
+    let mut previous = 0.0f64;
+    for line in lines.iter_mut() {
+        let stamp = line.time_sec;
+        let hit = measured
+            .iter()
+            .find(|m| (m["t"].as_f64().unwrap_or(-9.0) - stamp).abs() < 0.005)
+            .and_then(|m| m["words"].as_array())
+            .filter(|w| w.len() == line.words.len());
+        if let Some(times) = hit {
+            for (word, t) in line.words.iter_mut().zip(times) {
+                word.start = t[0].as_f64().unwrap_or(word.start);
+                word.end = t[1].as_f64().unwrap_or(word.end);
+            }
+            line.aligned = true;
+            // Show the line a beat before its first word so the eye can get there.
+            line.time_sec = line.words.first().map(|w| w.start - 0.15).unwrap_or(stamp);
+        } else {
+            for word in &mut line.words {
+                word.start += offset;
+                word.end += offset;
+            }
+            line.time_sec = stamp + offset;
+        }
+        line.time_sec = line.time_sec.max(previous + 0.01).max(0.0);
+        previous = line.time_sec;
+    }
 }
 
 #[cfg(test)]

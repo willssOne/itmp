@@ -9,18 +9,22 @@ A lightweight, fast, low-memory Spotify-style terminal music player written in R
 - **Spotify Artist Profiles & Liked Artists**: Click any artist name (in Library, Search, Now Playing, or press `A`) to load their profile, avatar, and Top Tracks from Spotify; like/follow artists (`f`) to pin them under `Artists` in your Library sidebar.
 - **Settings Menu (`,`)**: Manage your LRU audio cache (gauge, `-100 MB` / `+100 MB` limit adjuster, manual prune) and link Spotify playlists/albums, CSV/JSON exports, or OAuth PKCE login in one place.
 - **Live Word-by-Word Synced Lyrics**:
-  - Audio-envelope vocal alignment (`300–1900 Hz` via `ffmpeg`) tracks vocal bursts and breath pauses.
+  - Optional word-accurate sync (`itmp setup-sync`): a local Whisper model force-aligns the lyrics to the audio (about 15 s per song on CPU, cached as `.words.json`). Press `S` to re-fetch and re-sync.
+  - Without it, an audio-envelope estimate (via `ffmpeg`) is used.
+  - The characters just ahead of the one being sung glow softly, so you can read into the line.
   - **Parallel same-line adlibs**: Parenthesized adlibs `( ... )` animate on their own timeline simultaneously alongside main vocals on the same line.
   - Live per-track sync nudge (`[` / `]` / `\`) saved automatically.
-- **Album Art in Terminal**: Truecolor half-block (`▀`) album cover art plus compact `4x2` thumbnails next to every track and search result.
+- **Speed & Pitch**: Slow songs down or speed them up from the player bar or keyboard (`0.50x`-`2.00x`, up to an octave either way). Linked by default, so changing one automatically sets the other, like a record player (`pitch = 12 * log2(speed)` semitones); unlink to change them independently. The setting is saved, and lyrics and the censor filter stay in sync. Needs mpv 0.40 or newer.
+- **Album Art in Terminal**: Real pixels in terminals with sixel or kitty graphics (foot, kitty, ghostty, wezterm); 2x3 sextant block characters elsewhere (Alacritty, tmux). `ITMP_GRAPHICS=blocks` forces the latter.
+- **Censor Filter**: Toggle in Settings (`x`). Stars out explicit words on screen and briefly softens them in the audio using the synced lyric timings: a quick crossfade into a **Vocal dip** (the voice ducks, the beat stays) or **Underwater** sound, switchable in Settings (`v`). It deliberately covers little, so the end of a long word can slip through; songs without lyrics play unfiltered and are marked. Add your own words, one per line, in `~/.config/itmp/censor.txt`.
 - **Mouse & Keyboard Controls**: Clickable Play/Pause, Prev, Next, Shuffle, Repeat, Like, Artist, Lyrics toggle, Volume `[-]`/`[+]`, and click-to-seek progress bar with elapsed, total, and `-MM:SS left` countdown.
-- **Minimal ASCII UI**: Clean terminal interface with no emojis or heavy GUI frameworks.
+- **Themed UI**: Follows the active Omarchy theme live, with a built-in fallback palette. No emojis or heavy GUI frameworks.
 
 ## Requirements
 
 - Rust toolchain (`cargo`) to build
 - Runtime CLI tools:
-  - [`mpv`](https://mpv.io/) (audio playback via Unix IPC socket)
+  - [`mpv`](https://mpv.io/) 0.40+ (audio playback via Unix IPC socket)
   - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) (song search & download)
   - [`ffmpeg`](https://ffmpeg.org/) (vocal-band envelope extraction for lyric sync)
   - `curl` (LRCLIB lyrics, cover art, Spotify API)
@@ -42,6 +46,14 @@ cargo install --path .
 
 ## Usage
 
+### Maintenance
+
+```bash
+itmp setup-sync   # install word-level lyric sync (venv in ~/.local/share/itmp-align)
+itmp sync         # sync every downloaded song now
+itmp repair       # restore lost or mangled song names (also runs at startup)
+```
+
 ### Launch TUI
 
 ```bash
@@ -57,6 +69,10 @@ itmp
 | `n` / `b` | Next / Previous track |
 | `Left` / `Right` | Seek `-5s` / `+5s` (or click the progress bar) |
 | `+` / `-` | Volume up / down |
+| `<` / `>` | Speed down / up (`0.05x` steps) |
+| `{` / `}` | Pitch down / up (semitone steps) |
+| `t` | Link / unlink speed and pitch |
+| `0` | Reset speed and pitch |
 | `z` | Toggle Shuffle |
 | `r` | Cycle Repeat (`off` / `all` / `one`) |
 | `l` | Like / Pin track (protects from 500 MB LRU eviction) |

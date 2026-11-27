@@ -1,6 +1,9 @@
-use crate::cache::{
-    add_track_to_playlist, home_dir, is_audio_file, load_and_sync_library, now_ts,
-    pretty_title_from_filename, prune_lru, sanitize_slug, save_library,
+use crate::{
+    cache::{
+        add_track_to_playlist, edit_library, find_cached_track, home_dir, is_audio_file,
+        load_and_sync_library, now_ts, pretty_title_from_filename, prune_lru, sanitize_slug,
+    },
+    names,
 };
 use serde_json::Value;
 use std::{
@@ -13,9 +16,25 @@ use std::{
 pub struct SearchResult {
     pub id: String,
     pub duration: String,
+    /// Cleaned artist name; `channel` is the raw uploader.
     pub uploader: String,
+    pub channel: String,
     pub title: String,
     pub thumbnail: String,
+}
+
+impl SearchResult {
+    pub fn seconds(&self) -> u64 {
+        self.duration
+            .split(':')
+            .try_fold(0u64, |acc, p| p.parse::<u64>().ok().map(|n| acc * 60 + n))
+            .unwrap_or(0)
+    }
+
+    /// (title, artist) as this upload should be named in the library.
+    pub fn song_name(&self) -> (String, String) {
+        crate::names::from_upload(&self.title, &self.channel)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +77,8 @@ pub fn search_youtube(query: &str) -> Result<Vec<SearchResult>, String> {
     let mut results = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let parts: Vec<&str> = line.splitn(5, '\t').collect();
-        if parts.len() >= 4 {
+        // Channels and playlists come back without a duration; they can't be played.
+        if parts.len() >= 4 && parts[1].trim() != "NA" {
             let id = parts[0].trim().to_string();
             let thumb = parts
                 .get(4)
@@ -70,7 +90,8 @@ pub fn search_youtube(query: &str) -> Result<Vec<SearchResult>, String> {
             results.push(SearchResult {
                 id,
                 duration: parts[1].trim().to_string(),
-                uploader,
+                uploader: if uploader == "NA" { String::new() } else { uploader },
+                channel: parts[2].trim().to_string(),
                 title: parts[3].trim().to_string(),
                 thumbnail: thumb,
             });
@@ -262,75 +283,153 @@ fn download_cover_image(dir: &Path, stem: &str, url: &str) -> Option<String> {
     }
 }
 
+fn lrclib(endpoint: &str, params: &[(&str, &str)]) -> Option<Value> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sG", "--max-time", "8", "-A", "itmp/0.2"]);
+    for (key, value) in params {
+        cmd.arg("--data-urlencode").arg(format!("{key}={value}"));
+    }
+    let out = cmd.arg(format!("https://lrclib.net/api/{endpoint}")).output().ok()?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Synced lyrics from an LRCLIB record, only if it really is this song.
+fn lyrics_if_match<'a>(item: &'a Value, title: &str, artist: &str, dur: u64) -> Option<(u64, &'a str)> {
+    let text = item.get("syncedLyrics")?.as_str()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let name = item.get("trackName").and_then(|v| v.as_str())?;
+    let by = item.get("artistName").and_then(|v| v.as_str()).unwrap_or("");
+    if names::title_key(name, by) != names::title_key(title, artist) {
+        return None;
+    }
+    if !artist.trim().is_empty() && !names::same_artist(by, artist) {
+        return None;
+    }
+    let length = item.get("duration").and_then(|v| v.as_f64()).unwrap_or(0.0) as u64;
+    let gap = if dur > 0 && length > 0 { dur.abs_diff(length) } else { 3 };
+    (gap <= 8).then_some((gap, text))
+}
+
 pub fn fetch_synced_lrc(dir: &Path, stem: &str, title: &str, artist: &str, target_dur_sec: u64) -> bool {
     let lrc_path = dir.join(format!("{stem}.lrc"));
     if lrc_path.is_file() {
         return true;
     }
-    let mut cleaned = title.to_string();
-    for sep in ["[", "(Official", "(Lyrics", "(Audio", "|"] {
-        if let Some(i) = cleaned.find(sep) {
-            cleaned.truncate(i);
-        }
-    }
-    let q_title = cleaned.trim();
-    if q_title.is_empty() {
-        return false;
-    }
-    let query = if artist.trim().is_empty() {
-        q_title.to_string()
-    } else {
-        format!("{} {}", artist.trim(), q_title)
-    };
-    let output = Command::new("curl")
-        .args([
-            "-sG",
-            "--max-time",
-            "8",
-            "-A",
-            "itmp/0.1",
-            "--data-urlencode",
-            &format!("q={query}"),
-            "https://lrclib.net/api/search",
-        ])
-        .output();
-    let Ok(out) = output else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let Ok(val) = serde_json::from_slice::<Value>(&out.stdout) else {
-        return false;
-    };
-    let Some(arr) = val.as_array() else {
-        return false;
-    };
-    // Pick the syncedLyrics candidate whose duration best matches our audio track
-    let mut best: Option<(f64, &str)> = None;
-    for item in arr {
-        let Some(lrc) = item.get("syncedLyrics").and_then(|v| v.as_str()) else {
+    let q_title = names::clean_title(title, artist);
+    let q_artist = crate::cache::clean_artist_name(artist);
+    let first_artist = q_artist.split(',').next().unwrap_or("").trim();
+    let free = format!("{first_artist} {q_title}");
+    let queries: [&[(&str, &str)]; 3] = [
+        &[("track_name", &q_title), ("artist_name", first_artist)],
+        &[("q", &free)],
+        &[("track_name", &q_title)],
+    ];
+    for params in queries {
+        let Some(found) = lrclib("search", params) else {
             continue;
         };
-        if lrc.trim().is_empty() {
-            continue;
+        let best = found
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| lyrics_if_match(item, title, artist, target_dur_sec))
+            .min_by_key(|(gap, _)| *gap);
+        if let Some((_, lrc)) = best {
+            return fs::write(lrc_path, lrc).is_ok();
         }
-        let diff = if target_dur_sec > 0 {
-            item.get("duration")
-                .and_then(|d| d.as_f64())
-                .map(|d| (d - target_dur_sec as f64).abs())
-                .unwrap_or(999.0)
-        } else {
-            0.0
-        };
-        if best.map(|(bd, _)| diff < bd).unwrap_or(true) {
-            best = Some((diff, lrc));
-        }
-    }
-    if let Some((_, lrc)) = best {
-        return fs::write(lrc_path, lrc).is_ok();
     }
     false
+}
+
+/// Higher is better; `None` means the upload is not this song at all.
+fn score_upload(
+    up_title: &str,
+    channel: &str,
+    up_dur: u64,
+    title: &str,
+    artist: &str,
+    dur: u64,
+) -> Option<i64> {
+    let want = names::title_key(title, artist);
+    let (clean, up_artist) = names::from_upload(up_title, channel);
+    let have = names::norm(&clean);
+    let whole = names::norm(up_title);
+    let mut score = if have == want || names::title_key(up_title, artist) == want {
+        100
+    } else if whole.contains(&want) {
+        40
+    } else {
+        return None;
+    };
+    if !artist.trim().is_empty() {
+        let first = names::norm(artist.split(',').next().unwrap_or(artist));
+        if names::same_artist(&up_artist, artist) || names::same_artist(channel, artist) {
+            score += 40;
+        } else if whole.contains(&first) {
+            score += 15;
+        } else {
+            score -= 40;
+        }
+    }
+    if dur > 0 && up_dur > 0 {
+        let gap = dur.abs_diff(up_dur) as i64;
+        score += match gap {
+            0..=2 => 50,
+            3..=5 => 30,
+            6..=12 => 5,
+            _ => -gap.min(90),
+        };
+    }
+    let upload = names::fold_str(up_title);
+    let wanted = names::fold_str(title);
+    for bad in [
+        "live", "sped up", "speed up", "slowed", "reverb", "remix", "instrumental", "karaoke",
+        "cover", "nightcore", "8d", "loop", "1 hour", "snippet", "leak", "reaction", "type beat",
+        "clean", "bass boosted", "mashup", "acapella",
+    ] {
+        let has = |s: &str| {
+            format!(" {} ", s.split(|c: char| !c.is_alphanumeric()).collect::<Vec<_>>().join(" "))
+                .contains(&format!(" {bad} "))
+        };
+        if has(&upload) && !has(&wanted) {
+            score -= 60;
+        }
+    }
+    if channel.trim().ends_with("Topic") {
+        score += 20;
+    }
+    if upload.contains("official audio") {
+        score += 12;
+    } else if upload.contains("video") {
+        score -= 8;
+    }
+    Some(score)
+}
+
+/// Picks the upload whose name, artist and length match, instead of trusting hit #1.
+fn pick_youtube(title: &str, artist: &str, dur: u64) -> Result<String, String> {
+    let mut best: Option<(i64, String)> = None;
+    for query in [format!("{artist} {title}"), format!("{artist} {title} audio")] {
+        let hits = search_youtube(query.trim())?;
+        for (rank, hit) in hits.iter().enumerate() {
+            let Some(score) = score_upload(&hit.title, &hit.channel, hit.seconds(), title, artist, dur)
+            else {
+                continue;
+            };
+            let score = score - rank as i64;
+            if best.as_ref().map(|(b, _)| score > *b).unwrap_or(true) {
+                best = Some((score, hit.id.clone()));
+            }
+        }
+        if best.as_ref().map(|(s, _)| *s >= 150).unwrap_or(false) {
+            break;
+        }
+    }
+    best.filter(|(s, _)| *s > 40)
+        .map(|(_, id)| format!("https://www.youtube.com/watch?v={id}"))
+        .ok_or_else(|| format!("no upload on YouTube matches '{artist} - {title}'"))
 }
 
 pub fn download_and_cache_track(
@@ -344,18 +443,36 @@ pub fn download_and_cache_track(
     playlist_name: Option<&str>,
     max_bytes: u64,
 ) -> Result<(String, String), String> {
+    let video_id = yt_url_or_search
+        .split_once("watch?v=")
+        .map(|(_, id)| id.to_string());
+    let lib = load_and_sync_library(dir);
+    if let Some(have) = find_cached_track(&lib, title, artist, duration_sec, video_id.as_deref()) {
+        if let Some(pl) = playlist_name {
+            edit_library(dir, |lib| add_track_to_playlist(lib, pl, &have));
+        }
+        return Ok((have, format!("'{title}' is already downloaded")));
+    }
+
+    let source = if yt_url_or_search.starts_with("ytsearch") {
+        pick_youtube(title, artist, duration_sec)?
+    } else {
+        yt_url_or_search.to_string()
+    };
     let slug_src = if artist.is_empty() {
         title.to_string()
     } else {
         format!("{artist}-{title}")
     };
+    // The video id keeps two songs with look-alike names from sharing files.
     let slug = sanitize_slug(&slug_src);
-    let template = dir.join(format!("{slug}.%(ext)s"));
+    let template = dir.join(format!("{slug}-%(id)s.%(ext)s"));
 
     let out = Command::new("yt-dlp")
         .args([
             "-q",
             "--no-warnings",
+            "--no-playlist",
             "-f",
             "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
             "--print",
@@ -364,9 +481,11 @@ pub fn download_and_cache_track(
             "thumbnail",
             "--print",
             "duration",
+            "--print",
+            "ID=%(id)s",
             "-o",
-            template.to_str().unwrap_or("track.%(ext)s"),
-            yt_url_or_search,
+            template.to_str().unwrap_or("track-%(id)s.%(ext)s"),
+            &source,
         ])
         .output()
         .map_err(|e| format!("failed to run yt-dlp: {e}"))?;
@@ -381,7 +500,6 @@ pub fn download_and_cache_track(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    // --print outputs in order: thumbnail, duration, after_move:filepath (after_move prints last)
     let saved_path = lines
         .iter()
         .rev()
@@ -397,6 +515,10 @@ pub fn download_and_cache_track(
         .find_map(|l| l.parse::<f64>().ok())
         .map(|d| d as u64)
         .unwrap_or(duration_sec);
+    let source_id = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("ID="))
+        .map(str::to_string);
 
     let fname = Path::new(saved_path)
         .file_name()
@@ -415,33 +537,30 @@ pub fn download_and_cache_track(
 
     let got_lrc = fetch_synced_lrc(dir, stem, title, artist, yt_dur);
 
-    let mut lib = load_and_sync_library(dir);
-    if let Some(e) = lib.entries.get_mut(&fname) {
-        e.title = title.to_string();
-        if !artist.is_empty() {
+    let (_, (evicted, freed)) = edit_library(dir, |lib| {
+        if let Some(e) = lib.entries.get_mut(&fname) {
+            e.title = title.to_string();
             e.artist = artist.to_string();
-        }
-        if !album.is_empty() {
             e.album = album.to_string();
+            if saved_cover.is_some() {
+                e.cover = saved_cover;
+            }
+            if yt_dur > 0 {
+                e.duration_sec = yt_dur;
+            }
+            e.source_id = source_id;
+            e.last_used = now_ts();
         }
-        if saved_cover.is_some() {
-            e.cover = saved_cover;
+        if let Some(pl) = playlist_name {
+            add_track_to_playlist(lib, pl, &fname);
         }
-        if yt_dur > 0 {
-            e.duration_sec = yt_dur;
-        }
-        e.last_used = now_ts();
-    }
-    if let Some(pl) = playlist_name {
-        add_track_to_playlist(&mut lib, pl, &fname);
-    }
-    let (evicted, freed) = prune_lru(dir, &mut lib, max_bytes);
-    save_library(dir, &lib);
+        prune_lru(dir, lib, max_bytes)
+    });
 
     let msg = format!(
-        "Cached '{}'{}{}",
+        "Downloaded '{}'{}{}",
         title,
-        if got_lrc { " + LRC" } else { "" },
+        if got_lrc { " with lyrics" } else { "" },
         if evicted > 0 {
             format!(" (evicted {} old, -{:.1} MB)", evicted, freed as f64 / 1_048_576.0)
         } else {
@@ -656,8 +775,7 @@ pub fn import_local_music(dir: &Path, raw_path: &str, max_bytes: u64) -> Result<
         return Err("No audio files found at that path".into());
     }
 
-    let mut imported = 0usize;
-    let mut lib = load_and_sync_library(dir);
+    let mut copied = Vec::new();
     for f in &files {
         let ext = f
             .extension()
@@ -667,14 +785,14 @@ pub fn import_local_music(dir: &Path, raw_path: &str, max_bytes: u64) -> Result<
         let raw_stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
         let slug = sanitize_slug(raw_stem);
         let dest_name = format!("{slug}.{ext}");
-        let dest_path = dir.join(&dest_name);
-        if fs::copy(f, &dest_path).is_ok() {
-            let title = pretty_title_from_filename(raw_stem);
-            let _ = fetch_synced_lrc(dir, &slug, &title, "", 0);
-            // Copy sibling .lrc or cover art if present
+        if fs::copy(f, dir.join(&dest_name)).is_ok() {
+            // Copy sibling .lrc or cover art if present, else look lyrics up
             let sib_lrc = f.with_extension("lrc");
             if sib_lrc.is_file() {
                 let _ = fs::copy(&sib_lrc, dir.join(format!("{slug}.lrc")));
+            } else {
+                let title = pretty_title_from_filename(raw_stem);
+                let _ = fetch_synced_lrc(dir, &slug, &title, "", 0);
             }
             for cext in ["jpg", "jpeg", "png", "webp"] {
                 let sib_cov = f.with_extension(cext);
@@ -683,29 +801,20 @@ pub fn import_local_music(dir: &Path, raw_path: &str, max_bytes: u64) -> Result<
                     break;
                 }
             }
-            imported += 1;
-            if let Some(pl) = &pl_name {
-                add_track_to_playlist(&mut lib, pl, &dest_name);
-            }
+            copied.push(dest_name);
         }
     }
-    lib = load_and_sync_library(dir);
-    if let Some(pl) = &pl_name {
-        for f in &files {
-            let ext = f
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mp3")
-                .to_ascii_lowercase();
-            let raw_stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
-            let dest_name = format!("{}.{ext}", sanitize_slug(raw_stem));
-            if lib.entries.contains_key(&dest_name) {
-                add_track_to_playlist(&mut lib, pl, &dest_name);
+    let imported = copied.len();
+    let (_, (evicted, freed)) = edit_library(dir, |lib| {
+        if let Some(pl) = &pl_name {
+            for name in &copied {
+                if lib.entries.contains_key(name) {
+                    add_track_to_playlist(lib, pl, name);
+                }
             }
         }
-    }
-    let (evicted, freed) = prune_lru(dir, &mut lib, max_bytes);
-    save_library(dir, &lib);
+        prune_lru(dir, lib, max_bytes)
+    });
 
     let mut msg = format!("Imported {imported} local track(s)");
     if let Some(pl) = pl_name {

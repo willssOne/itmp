@@ -27,6 +27,9 @@ pub struct TrackEntry {
     pub liked: bool,
     #[serde(default)]
     pub lrc_offset_ms: i32,
+    /// YouTube video id the audio came from, for exact "already downloaded" checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,14 @@ pub struct Library {
     pub liked_artists: Vec<LikedArtist>,
     #[serde(default)]
     pub max_cache_mb: Option<u64>,
+    /// Star out explicit words and muffle them during playback.
+    #[serde(default)]
+    pub censor: bool,
+    #[serde(default)]
+    pub censor_style: crate::censor::Style,
+    /// Playback speed and pitch.
+    #[serde(default)]
+    pub tune: crate::tempo::Tune,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -96,8 +107,12 @@ pub fn sanitize_slug(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(64));
     let mut prev_dash = false;
     for ch in raw.chars() {
+        let plain = crate::names::fold(ch);
         if ch.is_ascii_alphanumeric() {
             out.push(ch);
+            prev_dash = false;
+        } else if plain.is_ascii_alphanumeric() {
+            out.push(if ch.is_uppercase() { plain.to_ascii_uppercase() } else { plain });
             prev_dash = false;
         } else if !prev_dash && !out.is_empty() {
             out.push('-');
@@ -142,13 +157,33 @@ fn find_cover_for_stem(dir: &Path, stem: &str) -> Option<String> {
     None
 }
 
-pub fn load_and_sync_library(dir: &Path) -> Library {
+fn index_path(dir: &Path) -> PathBuf {
+    dir.join(".cache_index.json")
+}
+
+/// Exclusive advisory lock shared by every thread and every itmp process.
+fn lock_index(dir: &Path) -> Option<fs::File> {
     let _ = fs::create_dir_all(dir);
-    let idx_path = dir.join(".cache_index.json");
-    let mut lib: Library = fs::read_to_string(&idx_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".cache_index.lock"))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
+fn read_and_sync(dir: &Path) -> Library {
+    let idx_path = index_path(dir);
+    let mut lib: Library = match fs::read_to_string(&idx_path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|_| {
+            // Keep the unreadable index around instead of silently overwriting it.
+            let _ = fs::copy(&idx_path, dir.join(".cache_index.broken.json"));
+            Library::default()
+        }),
+        Err(_) => Library::default(),
+    };
 
     let mut seen = HashMap::new();
 
@@ -193,6 +228,7 @@ pub fn load_and_sync_library(dir: &Path) -> Library {
                     last_used: mtime,
                     liked: false,
                     lrc_offset_ms: 0,
+                    source_id: None,
                 });
             seen.insert(fname, entry);
         }
@@ -204,16 +240,30 @@ pub fn load_and_sync_library(dir: &Path) -> Library {
     for pl in &mut lib.playlists {
         pl.tracks.retain(|f| lib.entries.contains_key(f));
     }
-
-    save_library(dir, &lib);
     lib
 }
 
-pub fn save_library(dir: &Path, lib: &Library) {
-    let idx_path = dir.join(".cache_index.json");
+fn write_index(dir: &Path, lib: &Library) {
     if let Ok(json) = serde_json::to_string_pretty(lib) {
-        let _ = fs::write(idx_path, json);
+        let tmp = dir.join(".cache_index.json.tmp");
+        if fs::write(&tmp, json).is_ok() {
+            let _ = fs::rename(tmp, index_path(dir));
+        }
     }
+}
+
+pub fn load_and_sync_library(dir: &Path) -> Library {
+    edit_library(dir, |_| ()).0
+}
+
+/// The only way to change the index: re-read, apply, write, all under the lock.
+/// Saving a stale in-memory copy is what used to wipe the names of new downloads.
+pub fn edit_library<R>(dir: &Path, change: impl FnOnce(&mut Library) -> R) -> (Library, R) {
+    let _guard = lock_index(dir);
+    let mut lib = read_and_sync(dir);
+    let out = change(&mut lib);
+    write_index(dir, &lib);
+    (lib, out)
 }
 
 pub fn total_cache_bytes(lib: &Library) -> u64 {
@@ -232,6 +282,7 @@ pub fn remove_track_files(dir: &Path, filename: &str) {
     let _ = fs::remove_file(dir.join(filename));
     if let Some(stem) = Path::new(filename).file_stem().and_then(|s| s.to_str()) {
         let _ = fs::remove_file(dir.join(format!("{stem}.lrc")));
+        let _ = fs::remove_file(dir.join(format!("{stem}.words.json")));
         for ext in ["jpg", "jpeg", "png", "webp"] {
             let _ = fs::remove_file(dir.join(format!("{stem}.{ext}")));
         }
@@ -266,7 +317,6 @@ pub fn prune_lru(dir: &Path, lib: &mut Library, max_bytes: u64) -> (usize, u64) 
         removed += 1;
         freed += sz;
     }
-    save_library(dir, lib);
     (removed, freed)
 }
 
@@ -293,35 +343,38 @@ pub fn clean_artist_name(raw: &str) -> String {
     s
 }
 
-fn norm_match(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .map(|c| match c {
-            'ë' | 'Ë' => 'e',
-            other => other.to_ascii_lowercase(),
-        })
-        .collect()
-}
-
-pub fn find_cached_track(lib: &Library, title: &str, artist: &str) -> Option<String> {
-    let nt = norm_match(title);
-    if nt.len() < 2 {
-        return None;
-    }
-    let na = norm_match(&clean_artist_name(artist));
-    for (fname, e) in &lib.entries {
-        let et = norm_match(&e.title);
-        if et == nt || (et.len() >= 4 && nt.len() >= 4 && (et.contains(&nt) || nt.contains(&et))) {
-            if na.is_empty() || e.artist.is_empty() {
-                return Some(fname.clone());
-            }
-            let ea = norm_match(&clean_artist_name(&e.artist));
-            if ea.contains(&na) || na.contains(&ea) || et == nt {
-                return Some(fname.clone());
-            }
+/// Strict lookup: same source video, or the same cleaned title by the same artist.
+pub fn find_cached_track(
+    lib: &Library,
+    title: &str,
+    artist: &str,
+    duration_sec: u64,
+    source_id: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = source_id {
+        if let Some(e) = lib.entries.values().find(|e| e.source_id.as_deref() == Some(id)) {
+            return Some(e.filename.clone());
         }
     }
-    None
+    let want = crate::names::title_key(title, artist);
+    if want.is_empty() {
+        return None;
+    }
+    lib.entries
+        .values()
+        .filter(|e| crate::names::title_key(&e.title, &e.artist) == want)
+        .filter(|e| artist.trim().is_empty() || crate::names::same_artist(&e.artist, artist))
+        .map(|e| {
+            let gap = if duration_sec > 0 && e.duration_sec > 0 {
+                duration_sec.abs_diff(e.duration_sec)
+            } else {
+                0
+            };
+            (gap, &e.filename)
+        })
+        .filter(|(gap, _)| *gap <= 20)
+        .min()
+        .map(|(_, f)| f.clone())
 }
 
 pub fn fmt_mb(bytes: u64) -> String {

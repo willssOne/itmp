@@ -53,6 +53,7 @@ impl AlbumDetail {
 pub struct ArtistProfile {
     pub name: String,
     pub spotify_id: Option<String>,
+    #[allow(dead_code)]
     pub spotify_url: Option<String>,
     pub image_url: Option<String>,
     pub fans: Option<u64>,
@@ -61,7 +62,7 @@ pub struct ArtistProfile {
     pub albums: Vec<AlbumSummary>,
 }
 
-fn curl_get_text(url: &str, timeout_secs: u32) -> Option<String> {
+pub fn curl_get_text(url: &str, timeout_secs: u32) -> Option<String> {
     let out = Command::new("curl")
         .args([
             "-sL",
@@ -110,13 +111,7 @@ pub fn parse_spotify_artist_id(input: &str) -> Option<String> {
 }
 
 fn norm_key(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric())
-        .map(|c| match c {
-            'ë' | 'Ë' => 'e',
-            other => other.to_ascii_lowercase(),
-        })
-        .collect()
+    crate::names::norm(s)
 }
 
 fn lookup_spotify_artist_id_via_musicbrainz(artist_name: &str) -> Option<String> {
@@ -336,8 +331,8 @@ fn fetch_deezer_artist(artist_name: &str) -> Option<DeezerArtistData> {
                         .unwrap_or("")
                         .to_string();
                     let cover_url = t
-                        .pointer("/album/cover_medium")
-                        .or_else(|| t.pointer("/album/cover_big"))
+                        .pointer("/album/cover_big")
+                        .or_else(|| t.pointer("/album/cover_medium"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     let duration_sec = t.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -484,15 +479,20 @@ pub fn find_and_fetch_album_by_name(artist: &str, album: &str) -> Result<AlbumDe
     let target_al = norm_key(album);
     let target_ar = norm_key(&clean_artist_name(artist));
 
+    let matches_artist = |a: &&AlbumSummary| {
+        target_ar.is_empty() || crate::names::same_artist(&a.artist, artist)
+    };
+    // Exact title first; never fall back to an unrelated album.
     let picked = results
         .iter()
-        .find(|a| {
-            let ak = norm_key(&a.title);
-            let ark = norm_key(&a.artist);
-            (ak == target_al || ak.contains(&target_al) || target_al.contains(&ak))
-                && (target_ar.is_empty() || ark.contains(&target_ar) || target_ar.contains(&ark))
+        .filter(matches_artist)
+        .find(|a| norm_key(&a.title) == target_al)
+        .or_else(|| {
+            results
+                .iter()
+                .filter(matches_artist)
+                .find(|a| norm_key(&a.title).starts_with(&target_al))
         })
-        .or_else(|| results.first())
         .ok_or_else(|| format!("Album '{album}' not found"))?;
 
     fetch_album_detail(picked.id)
@@ -536,11 +536,12 @@ pub fn fetch_artist_profile(
                 sp.image_url = d.image_url.clone();
             }
             for tr in &mut sp.top_tracks {
-                let tk = norm_key(&tr.title);
-                if let Some(m) = d.tracks.iter().find(|dt| {
-                    let dk = norm_key(&dt.title);
-                    !tk.is_empty() && (dk == tk || dk.contains(&tk) || tk.contains(&dk))
-                }) {
+                let tk = crate::names::title_key(&tr.title, &tr.artist);
+                if let Some(m) = d
+                    .tracks
+                    .iter()
+                    .find(|dt| crate::names::title_key(&dt.title, &dt.artist) == tk)
+                {
                     if tr.album.is_empty() {
                         tr.album = m.album.clone();
                     }

@@ -1,4 +1,8 @@
-use crate::cache::runtime_dir;
+use crate::{
+    cache::runtime_dir,
+    censor::{filter_graph, Style},
+    tempo::Tune,
+};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -31,6 +35,10 @@ pub struct MpvPlayer {
     child: Option<Child>,
     pub volume: i32,
     pub current_file: Option<String>,
+    tune: Tune,
+    /// Time ranges covered by the censor filter, and how they should sound.
+    censored: Vec<(f64, f64)>,
+    style: Style,
 }
 
 impl MpvPlayer {
@@ -42,6 +50,9 @@ impl MpvPlayer {
             child: None,
             volume: 65,
             current_file: None,
+            tune: Tune::default(),
+            censored: Vec::new(),
+            style: Style::default(),
         }
     }
 
@@ -88,7 +99,7 @@ impl MpvPlayer {
             .spawn()
             .map_err(|e| format!("failed to launch mpv: {e}"))?;
         self.child = Some(child);
-        for _ in 0..30 {
+        for _ in 0..100 {
             if self.sock_path.exists() {
                 return Ok(());
             }
@@ -98,8 +109,12 @@ impl MpvPlayer {
     }
 
     fn send_cmd(&self, cmd: Value) -> Option<Value> {
+        self.send_cmd_within(cmd, Duration::from_millis(120))
+    }
+
+    fn send_cmd_within(&self, cmd: Value, wait: Duration) -> Option<Value> {
         let mut stream = UnixStream::connect(&self.sock_path).ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(120)));
+        let _ = stream.set_read_timeout(Some(wait));
         let _ = stream.set_write_timeout(Some(Duration::from_millis(120)));
         let req = json!({ "command": cmd, "request_id": 1 });
         let line = format!("{req}\n");
@@ -124,11 +139,65 @@ impl MpvPlayer {
     pub fn play_file(&mut self, full_path: &Path, filename: &str) -> Result<(), String> {
         self.ensure_started()?;
         let path_str = full_path.to_str().ok_or("invalid path")?;
+        if !self.apply_censor() && !self.censored.is_empty() {
+            // Never play unfiltered when the filter was asked for.
+            return Err("mpv rejected the censor filter".into());
+        }
+        self.apply_tune();
         self.send_cmd(json!(["loadfile", path_str, "replace"]));
         self.send_cmd(json!(["set_property", "volume", self.volume]));
         self.send_cmd(json!(["set_property", "pause", false]));
         self.current_file = Some(filename.to_string());
         Ok(())
+    }
+
+    /// Replaces the censored ranges, live if something is playing.
+    pub fn set_censored(&mut self, ranges: Vec<(f64, f64)>, style: Style) -> bool {
+        if ranges == self.censored && style == self.style {
+            return true;
+        }
+        self.censored = ranges;
+        self.style = style;
+        !self.sock_path.exists() || self.apply_censor()
+    }
+
+    /// Applied inside mpv, so the timing never depends on the UI.
+    fn apply_censor(&self) -> bool {
+        // Rebuilding the filter chain can take a moment mid-song.
+        let filters = match filter_graph(&self.censored, self.style) {
+            Some(graph) => json!([{ "name": "lavfi", "params": { "graph": graph } }]),
+            None => json!(""),
+        };
+        let cmd = json!(["set_property", "af", filters]);
+        self.send_cmd_within(cmd, Duration::from_secs(1))
+            .is_some_and(|r| r["error"] == "success")
+    }
+
+    /// Changes speed and pitch, live if something is playing.
+    pub fn set_tune(&mut self, tune: Tune) -> bool {
+        self.tune = tune;
+        !self.sock_path.exists() || self.apply_tune()
+    }
+
+    fn apply_tune(&self) -> bool {
+        // Linked, mpv simply resamples (no time-stretch artefacts) and the pitch
+        // follows the speed by itself. Unlinked, it stretches time and shifts pitch.
+        let (correction, pitch) = if self.tune.linked {
+            (false, 1.0)
+        } else {
+            (true, self.tune.pitch_factor())
+        };
+        [
+            ("audio-pitch-correction", json!(correction)),
+            ("pitch", json!(pitch)),
+            ("speed", json!(self.tune.speed)),
+        ]
+        .into_iter()
+        .all(|(name, value)| {
+            let cmd = json!(["set_property", name, value]);
+            self.send_cmd_within(cmd, Duration::from_secs(1))
+                .is_some_and(|r| r["error"] == "success")
+        })
     }
 
     pub fn toggle_pause(&self) {
