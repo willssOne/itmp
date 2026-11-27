@@ -1,0 +1,21 @@
+[package]
+name = "itmp"
+version = "0.1.0"
+edition = "2021"
+description = "In-Terminal Music Player — lightweight Rust TUI music player with word-by-word synced lyrics, album art, Spotify import & 500 MB LRU cache"
+license = "MIT"
+repository = "https://github.com/wguijweguiuhwf/itmp"
+
+[dependencies]
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

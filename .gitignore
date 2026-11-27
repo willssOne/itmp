@@ -1,0 +1,6 @@
+/target
+*.swp
+*.swo
+.DS_Store
+spotify.json
+.cache_index.json
