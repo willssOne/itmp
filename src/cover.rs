@@ -1,5 +1,5 @@
 use crate::cache::{runtime_dir, sanitize_slug};
-use image::imageops::FilterType;
+use image::{imageops::FilterType, ImageReader};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -20,12 +20,20 @@ pub struct CoverArt {
     pub lines: Vec<Line<'static>>,
 }
 
+fn open_image_any_ext(path: &Path) -> Option<image::DynamicImage> {
+    ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()
+}
+
 impl CoverArt {
     pub fn load(path: &Path, cols: u16, rows: u16) -> Option<Self> {
         let w = (cols as u32).max(4);
         let h = ((rows as u32) * 2).max(4);
-        let img = image::open(path)
-            .ok()?
+        let img = open_image_any_ext(path)?
             .resize_exact(w, h, FilterType::Triangle)
             .to_rgb8();
 
@@ -81,8 +89,7 @@ pub fn fetch_remote_image_to_temp(url: &str, key: &str) -> Option<PathBuf> {
 
 pub fn decode_thumb(path: &Path) -> Option<ThumbRows> {
     // 4 cols wide x 2 rows tall (4x4 truecolor pixels -> crisp square mini cover in monospace)
-    let img = image::open(path)
-        .ok()?
+    let img = open_image_any_ext(path)?
         .resize_exact(4, 4, FilterType::Triangle)
         .to_rgb8();
     let mut r0 = Vec::with_capacity(4);

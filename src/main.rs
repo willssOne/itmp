@@ -194,7 +194,6 @@ struct App {
 
     lrc_lines: Vec<LrcLine>,
     lrc_file: Option<String>,
-    lrc_audio_synced: bool,
     cover_art: Option<CoverArt>,
     cover_size: (u16, u16),
     thumbs: ThumbCache,
@@ -272,7 +271,6 @@ impl App {
             rng_seed: now_ts() ^ 0x9e37_79b9_7f4a_7c15,
             lrc_lines: Vec::new(),
             lrc_file: None,
-            lrc_audio_synced: false,
             cover_art: None,
             cover_size: (0, 0),
             thumbs: ThumbCache::default(),
@@ -296,7 +294,7 @@ impl App {
             artist_track_state: ListState::default(),
             hits: HitAreas::default(),
             last_click: None,
-            status: "Space play | Enter play | / search | A artist | , settings | l like | L lyrics | [ ] sync | q quit".into(),
+            status: "Ready".into(),
             busy: false,
             tx,
             rx,
@@ -683,7 +681,6 @@ impl App {
         }
         self.lrc_lines = load_lrc(&self.dir, fname, None);
         self.lrc_file = Some(fname.to_string());
-        self.lrc_audio_synced = false;
 
         if !self.lrc_lines.is_empty() {
             let dir = self.dir.clone();
@@ -891,7 +888,7 @@ impl App {
                         self.view = View::Search;
                         self.focus = Focus::Main;
                         self.input_mode = InputMode::SearchResults;
-                        self.status = "Enter/Click: Play & Save | Click Artist or press A: Spotify Profile | d: Download | /: New".into();
+                        self.status = format!("{} results for '{}'", self.search_results.len(), self.last_search_query);
                     }
                 }
                 WorkerMsg::SearchDone(Err(e)) => {
@@ -923,7 +920,6 @@ impl App {
                 WorkerMsg::LyricsAligned(fname, lines) => {
                     if self.lrc_file.as_deref() == Some(fname.as_str()) {
                         self.lrc_lines = lines;
-                        self.lrc_audio_synced = true;
                     }
                 }
                 WorkerMsg::SpotifyLoginDone(Ok(sess)) => {
@@ -961,9 +957,7 @@ impl App {
                     self.spotify_open_col = Some(col);
                     self.spotify_tracks = tracks;
                     self.spotify_track_state.select(if n > 0 { Some(0) } else { None });
-                    self.status = format!(
-                        "Spotify '{name}' ({n} tracks): Enter/Click play | d download | a import all | Esc back"
-                    );
+                    self.status = format!("Spotify: {name} ({n} tracks)");
                 }
                 WorkerMsg::SpotifyTracksDone(Err(e)) => {
                     self.busy = false;
@@ -979,7 +973,7 @@ impl App {
                     self.spotify_col_state.select(Some(0));
                     let col = SpotifyCollection {
                         name: link.name.clone(),
-                        subtitle: format!("Spotify {} (no Premium needed)", link.kind),
+                        subtitle: format!("Spotify {}", link.kind),
                         track_count: tracks.len(),
                         cover_url: link.cover_url.clone(),
                         kind: SpotifyCollectionKind::PublicUrl { url: link.url },
@@ -988,10 +982,7 @@ impl App {
                     self.spotify_open_col = Some(col);
                     self.spotify_tracks = tracks;
                     self.spotify_track_state.select(if n > 0 { Some(0) } else { None });
-                    self.status = format!(
-                        "Linked '{}' ({n} tracks)! Enter/Click play & save | a import all | Esc back",
-                        link.name
-                    );
+                    self.status = format!("Linked '{}' ({n} tracks)", link.name);
                 }
                 WorkerMsg::SpotifyPublicUrlAdded(Err(e)) => {
                     self.busy = false;
@@ -1004,9 +995,7 @@ impl App {
                     let name = prof.name.clone();
                     self.artist_track_state.select(if n > 0 { Some(0) } else { None });
                     self.artist_profile = Some(prof);
-                    self.status = format!(
-                        "Artist '{name}' ({n} top tracks): Enter/Click play | f like artist | d download | a import all"
-                    );
+                    self.status = format!("Artist: {name} ({n} top tracks)");
                 }
                 WorkerMsg::ArtistLoaded(Err(e)) => {
                     self.busy = false;
@@ -2035,12 +2024,13 @@ fn fmt_fans(n: u64) -> String {
 fn render_inline_buttons(
     defs: Vec<(String, Style, Option<ButtonAction>)>,
     area: Rect,
+    top_offset: u16,
     hits: &mut Vec<(Rect, ButtonAction)>,
 ) -> Line<'static> {
     let mut spans = Vec::new();
     let mut cursor_x = area.x + 1;
     let max_x = area.x + area.width.saturating_sub(1);
-    let btn_y = area.y + 1;
+    let btn_y = area.y + top_offset;
     for (label, style, action_opt) in defs {
         let w = label.chars().count() as u16;
         if cursor_x + w > max_x {
@@ -2555,7 +2545,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     let msg = if app.busy {
                         format!("\n  Searching for '{}'...", app.last_search_query)
                     } else {
-                        "\n  Type a song name, artist, or paste a Spotify / YouTube link in the top Search bar.\n\n  - Click any song or press Enter to download & play\n  - Click the artist name (cyan) or press A to open their Spotify Artist Profile\n  - Press d to download in background without interrupting playback".to_string()
+                        "\n  Search for songs, artists, or paste a Spotify / YouTube URL above.".to_string()
                     };
                     let empty_search = Paragraph::new(msg)
                         .style(Style::default().fg(if app.busy { Color::Yellow } else { Color::Gray }))
@@ -2568,14 +2558,14 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         );
                     f.render_widget(empty_search, main_area);
                 } else {
-                    let title_max = main_area.width.saturating_sub(24).clamp(16, 48) as usize;
+                    let title_max = main_area.width.saturating_sub(28).clamp(16, 48) as usize;
                     let items: Vec<ListItem> = app
                         .search_results
                         .iter()
                         .map(|r| {
                             let thumb_key = format!("yt:{}", r.id);
                             let thumb_rows = app.thumbs.get_by_key(&thumb_key).cloned();
-                            let cached = find_cached_track(&app.lib, &r.title, &r.uploader).is_some();
+                            let downloaded = find_cached_track(&app.lib, &r.title, &r.uploader).is_some();
 
                             let mut l1: Vec<Span<'static>> = Vec::new();
                             let mut l2: Vec<Span<'static>> = Vec::new();
@@ -2583,8 +2573,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 l1.extend(t0);
                                 l2.extend(t1);
                             } else {
-                                l1.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
-                                l2.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                                l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
+                                l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
                             }
                             l1.push(Span::raw(" "));
                             l2.push(Span::raw(" "));
@@ -2595,24 +2585,23 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
                             l1.push(Span::styled(
                                 format!("[{:>5}] ", r.duration),
-                                Style::default().fg(Color::Green),
+                                Style::default().fg(Color::Rgb(118, 238, 148)),
                             ));
                             l1.push(Span::styled(
                                 t_disp,
-                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Rgb(244, 244, 246)).add_modifier(Modifier::BOLD),
                             ));
-                            if cached {
-                                l1.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            if downloaded {
+                                l1.push(Span::styled(
+                                    " [DOWNLOADED]",
+                                    Style::default().fg(Color::Rgb(118, 238, 148)),
+                                ));
                             }
 
                             l2.push(Span::styled("        ", Style::default()));
                             l2.push(Span::styled(
                                 r.uploader.clone(),
                                 Style::default().fg(Color::Cyan),
-                            ));
-                            l2.push(Span::styled(
-                                "  (click artist or press A for profile)",
-                                Style::default().fg(Color::DarkGray),
                             ));
 
                             ListItem::new(vec![Line::from(l1), Line::from(l2)])
@@ -2623,14 +2612,11 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
-                                .title(format!(
-                                    " Search Results ({}) [Enter: Play | A/Click Artist: Profile | d: Dl] ",
-                                    app.search_results.len()
-                                )),
+                                .title(format!(" Search Results ({}) ", app.search_results.len())),
                         )
                         .highlight_style(
                             Style::default()
-                                .bg(Color::DarkGray)
+                                .bg(Color::Rgb(46, 52, 62))
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("| ");
@@ -2664,7 +2650,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
 
                 if let Some(prof) = &app.artist_profile {
                     let liked = app.is_artist_liked(&prof.name);
-                    let cached_cnt = app
+                    let dl_cnt = app
                         .lib
                         .entries
                         .values()
@@ -2683,28 +2669,32 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     let mut meta_lines = vec![Line::from(vec![
                         Span::styled(
                             format!(" {}", prof.name),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Rgb(245, 245, 248)).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
                             format!("  [{}]", prof.source),
-                            Style::default().fg(Color::Green),
+                            Style::default().fg(Color::Rgb(118, 238, 148)),
                         ),
                     ])];
-                    let mut sub = format!(" {} tracks cached locally", cached_cnt);
+                    let mut sub = format!(" {} tracks downloaded", dl_cnt);
                     if let Some(fans) = prof.fans {
                         sub.push_str(&format!("  |  {}", fmt_fans(fans)));
                     }
-                    meta_lines.push(Line::from(Span::styled(sub, Style::default().fg(Color::Gray))));
+                    meta_lines.push(Line::from(Span::styled(sub, Style::default().fg(Color::Rgb(165, 170, 180)))));
                     if let Some(u) = &prof.spotify_url {
                         meta_lines.push(Line::from(Span::styled(
                             format!(" {u}"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     }
-                    let info_box = Paragraph::new(meta_lines)
-                        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(Color::Green)));
+                    let info_box = Paragraph::new(meta_lines).block(
+                        Block::default()
+                            .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                            .border_style(Style::default().fg(Color::Green)),
+                    );
                     f.render_widget(info_box, info_rows[0]);
 
+                    // Top border is omitted on info_rows[1], so button text sits on row offset 0!
                     let btn_line = render_inline_buttons(
                         vec![
                             (
@@ -2721,7 +2711,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             ),
                             (
                                 "[ + Import Top Tracks ]".into(),
-                                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD),
                                 Some(ButtonAction::ArtistImportAll),
                             ),
                             (
@@ -2731,15 +2721,19 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             ),
                         ],
                         info_rows[1],
+                        0,
                         &mut app.hits.buttons,
                     );
-                    let act_bar = Paragraph::new(btn_line)
-                        .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(Color::Green)));
+                    let act_bar = Paragraph::new(btn_line).block(
+                        Block::default()
+                            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                            .border_style(Style::default().fg(Color::Green)),
+                    );
                     f.render_widget(act_bar, info_rows[1]);
 
-                    // Artist Top Tracks (2-line rows with 4x2 album cover art!)
+                    // Artist Top Tracks (2-line rows with 4x2 album cover art)
                     app.hits.track_list = artist_rows[1];
-                    let title_max = artist_rows[1].width.saturating_sub(24).clamp(16, 46) as usize;
+                    let title_max = artist_rows[1].width.saturating_sub(28).clamp(16, 46) as usize;
                     let items: Vec<ListItem> = prof
                         .top_tracks
                         .iter()
@@ -2750,7 +2744,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 .as_ref()
                                 .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
                                 .cloned();
-                            let cached = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
+                            let downloaded = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
 
                             let mut l1: Vec<Span<'static>> = Vec::new();
                             let mut l2: Vec<Span<'static>> = Vec::new();
@@ -2758,8 +2752,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 l1.extend(t0);
                                 l2.extend(t1);
                             } else {
-                                l1.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
-                                l2.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                                l1.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
+                                l2.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
                             }
                             l1.push(Span::raw(" "));
                             l2.push(Span::raw(" "));
@@ -2770,14 +2764,17 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             }
                             l1.push(Span::styled(
                                 format!("{:>2}. ", i + 1),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(Color::Rgb(135, 140, 150)),
                             ));
                             l1.push(Span::styled(
                                 t_disp,
-                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Rgb(244, 244, 246)).add_modifier(Modifier::BOLD),
                             ));
-                            if cached {
-                                l1.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            if downloaded {
+                                l1.push(Span::styled(
+                                    " [DOWNLOADED]",
+                                    Style::default().fg(Color::Rgb(118, 238, 148)),
+                                ));
                             }
 
                             let dur = if tr.duration_sec > 0 {
@@ -2790,7 +2787,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                                 sub.push_str(&format!(" - {}", tr.album));
                             }
                             sub.push_str(&format!(" | {dur}"));
-                            l2.push(Span::styled(sub, Style::default().fg(Color::DarkGray)));
+                            l2.push(Span::styled(sub, Style::default().fg(Color::Rgb(155, 160, 170))));
 
                             ListItem::new(vec![Line::from(l1), Line::from(l2)])
                         })
@@ -2801,14 +2798,11 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(main_border)
-                                .title(format!(
-                                    " Top Tracks ({}) [Enter/Click: Play | d: Download | f: Like Artist | a: Import All] ",
-                                    prof.top_tracks.len()
-                                )),
+                                .title(format!(" Top Tracks ({}) ", prof.top_tracks.len())),
                         )
                         .highlight_style(
                             Style::default()
-                                .bg(Color::DarkGray)
+                                .bg(Color::Rgb(46, 52, 62))
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("| ");
@@ -2817,20 +2811,31 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     let loading_msg = app
                         .artist_loading_name
                         .as_deref()
-                        .map(|n| format!("\n  Loading Spotify profile for '{n}'..."))
-                        .unwrap_or_else(|| "\n  Click any artist name or press A on a song to view their Spotify profile.".into());
+                        .map(|n| format!("\n  Loading profile for '{n}'..."))
+                        .unwrap_or_else(|| "\n  Select an artist to view their profile.".into());
                     let p = Paragraph::new(loading_msg)
                         .style(Style::default().fg(Color::Yellow))
                         .block(Block::default().borders(Borders::ALL).title(" Artist Profile "));
                     f.render_widget(p, hdr_cols[1]);
                 }
             } else if matches!(app.view, View::Settings) {
+                // Settings split: Left = Cache + Spotify Linking | Right = Keybinds reference
+                let (settings_left, keybinds_opt) = if main_area.width >= 82 {
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                        .split(main_area);
+                    (cols[0], Some(cols[1]))
+                } else {
+                    (main_area, None)
+                };
+
                 let s_rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(8), Constraint::Min(10)])
-                    .split(main_area);
+                    .split(settings_left);
 
-                // Section 1: Audio Cache Settings (moved out of top bar!)
+                // Section 1: Audio Cache Settings
                 let cache_inner = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(3), Constraint::Length(2), Constraint::Length(3)])
@@ -2838,30 +2843,34 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
 
                 let used = total_cache_bytes(&app.lib);
                 let ratio = ((used as f64) / (app.max_bytes.max(1) as f64)).clamp(0.0, 1.0);
+                let cache_label = format!(
+                    "{} / {} ({} tracks, {} liked)",
+                    fmt_mb(used),
+                    fmt_mb(app.max_bytes),
+                    app.lib.entries.len(),
+                    app.lib.entries.values().filter(|e| e.liked).count()
+                );
                 let gauge = Gauge::default()
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Yellow))
-                            .title(" Settings: Audio Cache "),
+                            .title(" Audio Cache "),
                     )
-                    .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                    .gauge_style(Style::default().fg(Color::Rgb(68, 152, 92)).bg(Color::Rgb(36, 38, 44)))
                     .ratio(ratio)
-                    .label(format!(
-                        "{} / {} ({} tracks, {} liked/pinned)",
-                        fmt_mb(used),
-                        fmt_mb(app.max_bytes),
-                        app.lib.entries.len(),
-                        app.lib.entries.values().filter(|e| e.liked).count()
+                    .label(Span::styled(
+                        cache_label,
+                        Style::default().fg(Color::Rgb(245, 245, 248)).add_modifier(Modifier::BOLD),
                     ));
                 f.render_widget(gauge, cache_inner[0]);
 
                 let cache_path_p = Paragraph::new(format!(
-                    " Cache folder: {}  |  Limit: {} MB",
+                    " Folder: {}  |  Limit: {} MB",
                     app.dir.display(),
                     app.max_bytes / 1_048_576
                 ))
-                .style(Style::default().fg(Color::Gray));
+                .style(Style::default().fg(Color::Rgb(165, 170, 180)));
                 f.render_widget(cache_path_p, cache_inner[1]);
 
                 let cache_btns = render_inline_buttons(
@@ -2869,17 +2878,18 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         ("[ -100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheDec)),
                         ("[ +100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheInc)),
                         (
-                            "[ Prune LRU Now ]".into(),
+                            "[ Prune LRU ]".into(),
                             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                             Some(ButtonAction::PruneCache),
                         ),
                         (
-                            "[ + Import URL / Folder ]".into(),
+                            "[ + Import ]".into(),
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                             Some(ButtonAction::Import),
                         ),
                     ],
                     cache_inner[2],
+                    1,
                     &mut app.hits.buttons,
                 );
                 let cache_bar = Paragraph::new(cache_btns)
@@ -2893,13 +2903,13 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     .split(s_rows[1]);
 
                 let mut sp_btn_defs = vec![(
-                    "[ + Link Spotify URL / CSV ]".into(),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    "[ + Link URL / CSV ]".into(),
+                    Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD),
                     Some(ButtonAction::SpotifyAddUrl),
                 )];
                 if app.spotify.is_logged_in() {
                     sp_btn_defs.push((
-                        format!("Spotify: {}", app.spotify.display_name),
+                        format!("({})", app.spotify.display_name),
                         Style::default().fg(Color::Gray),
                         None,
                     ));
@@ -2915,7 +2925,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     ));
                 } else {
                     sp_btn_defs.push((
-                        "[ OAuth Login (Premium) ]".into(),
+                        "[ OAuth Login ]".into(),
                         Style::default().fg(Color::Cyan),
                         Some(ButtonAction::SpotifyLoginPrompt),
                     ));
@@ -2925,12 +2935,12 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         Some(ButtonAction::SpotifyDashboard),
                     ));
                 }
-                let sp_btn_line = render_inline_buttons(sp_btn_defs, sp_rows[0], &mut app.hits.buttons);
+                let sp_btn_line = render_inline_buttons(sp_btn_defs, sp_rows[0], 1, &mut app.hits.buttons);
                 let sp_bar = Paragraph::new(sp_btn_line).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Green))
-                        .title(" Settings: Spotify Linking & Playlists "),
+                        .title(" Spotify Linking "),
                 );
                 f.render_widget(sp_bar, sp_rows[0]);
 
@@ -2945,14 +2955,17 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             } else {
                                 "--:--".to_string()
                             };
-                            let cached = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
+                            let downloaded = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
                             let mut spans = vec![
-                                Span::styled(format!("[{:>5}] ", dur), Style::default().fg(Color::Green)),
-                                Span::raw(format!("{} ", tr.title)),
+                                Span::styled(format!("[{:>5}] ", dur), Style::default().fg(Color::Rgb(118, 238, 148))),
+                                Span::styled(format!("{} ", tr.title), Style::default().fg(Color::Rgb(244, 244, 246))),
                                 Span::styled(format!("- {}", tr.artist), Style::default().fg(Color::Cyan)),
                             ];
-                            if cached {
-                                spans.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            if downloaded {
+                                spans.push(Span::styled(
+                                    " [DOWNLOADED]",
+                                    Style::default().fg(Color::Rgb(118, 238, 148)),
+                                ));
                             }
                             ListItem::new(Line::from(spans))
                         })
@@ -2962,26 +2975,21 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
-                                .title(format!(
-                                    " Spotify: {} ({}) [Enter: Play | d: Dl | a: Import All | A: Artist | Esc: Back] ",
-                                    col.name,
-                                    app.spotify_tracks.len()
-                                )),
+                                .title(format!(" Spotify: {} ({}) ", col.name, app.spotify_tracks.len())),
                         )
                         .highlight_style(
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Green)
+                                .bg(Color::Rgb(46, 52, 62))
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("+ ");
                     f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_track_state);
                 } else if app.spotify_cols.is_empty() {
                     let help = format!(
-                        "\n  No Spotify playlists linked yet.\n\n  FREE (No Spotify Premium needed):\n    Click [ + Link Spotify URL / CSV ] (or press p) and paste ANY Spotify\n    playlist, album, or track URL -- or an Exportify .csv / Spotify .json file.\n\n  SPOTIFY OAUTH LOGIN (Requires Spotify Premium for Developer API):\n    Click [ Dashboard ] (o) -> add Redirect URI: {SPOTIFY_REDIRECT_URI}\n    Then click [ OAuth Login ] (c) and paste your Client ID."
+                        "\n  Link any public Spotify playlist or album URL (or Exportify .csv /\n  Spotify .json) using [ + Link URL / CSV ] -- no Premium required.\n\n  For Spotify OAuth (Premium): set Redirect URI to\n  {SPOTIFY_REDIRECT_URI} in Dashboard, then click [ OAuth Login ]."
                     );
                     let p = Paragraph::new(help)
-                        .style(Style::default().fg(Color::Gray))
+                        .style(Style::default().fg(Color::Rgb(155, 160, 170)))
                         .wrap(Wrap { trim: false })
                         .block(
                             Block::default()
@@ -2998,11 +3006,11 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             ListItem::new(Line::from(vec![
                                 Span::styled(
                                     format!("{} ", c.name),
-                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                    Style::default().fg(Color::Rgb(244, 244, 246)).add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     format!("({}) - {}", c.track_count, c.subtitle),
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(Color::Rgb(155, 160, 170)),
                                 ),
                             ]))
                         })
@@ -3012,21 +3020,74 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
-                                .title(" Linked Spotify Playlists [Enter/Click: Open | p: Add URL/CSV | d: Unlink] "),
+                                .title(" Linked Spotify Playlists "),
                         )
                         .highlight_style(
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Green)
+                                .bg(Color::Rgb(46, 52, 62))
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("> ");
                     f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_col_state);
                 }
+
+                // Section 3: Keybinds reference inside Settings
+                if let Some(kb_area) = keybinds_opt {
+                    let kb_rows = vec![
+                        ("Playback", None),
+                        ("Space", Some("Play / Pause")),
+                        ("Enter / Click", Some("Play or download song")),
+                        ("n / b", Some("Next / Previous track")),
+                        ("Left / Right", Some("Seek -5s / +5s (or click bar)")),
+                        ("+ / -", Some("Volume up / down")),
+                        ("z / r", Some("Shuffle / Repeat mode")),
+                        ("", None),
+                        ("Navigation & Search", None),
+                        ("/ or s", Some("Focus Search bar")),
+                        ("A / Click Name", Some("Open Artist Profile")),
+                        ("f", Some("Like / Follow Artist")),
+                        ("a", Some("Import All (Artist/Spotify)")),
+                        (", (comma)", Some("Open Settings")),
+                        ("Tab / Esc", Some("Switch pane / Go back")),
+                        ("", None),
+                        ("Library & Lyrics", None),
+                        ("l", Some("Like song (pin from cache)")),
+                        ("L", Some("Toggle live lyrics")),
+                        ("[ / ] / \\", Some("Lyrics sync -50ms / +50ms / 0")),
+                        ("d", Some("Download (Search/Artist) / Delete")),
+                        ("Q / N / P", Some("Queue / New / Add to Playlist")),
+                        ("i / p / c", Some("Import / Link Spotify / Prune")),
+                        ("q", Some("Quit itmp")),
+                    ];
+                    let lines: Vec<Line<'static>> = kb_rows
+                        .into_iter()
+                        .map(|(k, desc)| match desc {
+                            None if k.is_empty() => Line::from(""),
+                            None => Line::from(Span::styled(
+                                format!(" {k}"),
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            )),
+                            Some(d) => Line::from(vec![
+                                Span::styled(
+                                    format!(" {:<15}", k),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(d.to_string(), Style::default().fg(Color::Rgb(185, 190, 200))),
+                            ]),
+                        })
+                        .collect();
+                    let kb_widget = Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::DarkGray))
+                            .title(" Keybinds "),
+                    );
+                    f.render_widget(kb_widget, kb_area);
+                }
             } else {
                 // Library Track Views: All Tracks / Liked Songs / Queue / Playlist
                 let pane_title = match &app.view {
-                    View::AllTracks => format!(" All Tracks ({})  [Click Artist or press A for Spotify profile] ", app.track_list.len()),
+                    View::AllTracks => format!(" All Tracks ({}) ", app.track_list.len()),
                     View::Liked => format!(" * Liked Songs ({}) ", app.track_list.len()),
                     View::Queue => format!(" Queue ({}) ", app.track_list.len()),
                     View::Playlist(idx) => app
@@ -3075,8 +3136,8 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             line1_spans.extend(t0);
                             line2_spans.extend(t1);
                         } else {
-                            line1_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
-                            line2_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                            line1_spans.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
+                            line2_spans.push(Span::styled("    ", Style::default().bg(Color::Rgb(42, 44, 50))));
                         }
                         line1_spans.push(Span::raw(" "));
                         line2_spans.push(Span::raw(" "));
@@ -3090,7 +3151,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             "   "
                         };
                         let tag_style = if is_cur {
-                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                            Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD)
                         } else if liked {
                             Style::default().fg(Color::Yellow)
                         } else {
@@ -3105,9 +3166,9 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                         line1_spans.push(Span::styled(
                             t_disp,
                             if is_cur {
-                                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                                Style::default().fg(Color::Rgb(118, 238, 148)).add_modifier(Modifier::BOLD)
                             } else {
-                                Style::default().fg(Color::White)
+                                Style::default().fg(Color::Rgb(244, 244, 246))
                             },
                         ));
 
@@ -3126,11 +3187,11 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                             } else {
                                 format!(" | {} | {}", dur_s, lrc_s)
                             };
-                            line2_spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
+                            line2_spans.push(Span::styled(rest, Style::default().fg(Color::Rgb(155, 160, 170))));
                         } else {
                             line2_spans.push(Span::styled(
                                 format!("{} | {} | {}", dur_s, lrc_s, fmt_mb(size_b)),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(Color::Rgb(155, 160, 170)),
                             ));
                         }
 
@@ -3147,29 +3208,22 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     )
                     .highlight_style(
                         Style::default()
-                            .bg(Color::DarkGray)
+                            .bg(Color::Rgb(46, 52, 62))
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("| ");
                 f.render_stateful_widget(list, main_area, &mut app.track_state);
             }
 
-            // Live Word-by-Word Synced Lyrics panel (parallel adlibs, no shader)
+            // Live Word-by-Word Synced Lyrics panel
             if let Some(lrc_area) = lyrics_area_opt {
                 let lrc_title = app
                     .current_track_entry()
                     .map(|e| {
-                        let mut tags = Vec::new();
-                        if app.lrc_audio_synced {
-                            tags.push("audio-sync".to_string());
-                        }
                         if e.lrc_offset_ms != 0 {
-                            tags.push(format!("{:+.2}s", e.lrc_offset_ms as f64 / 1000.0));
-                        }
-                        if tags.is_empty() {
-                            format!(" Lyrics - {} ([ / ] sync) ", e.title)
+                            format!(" Lyrics - {} [{:+.2}s] ", e.title, e.lrc_offset_ms as f64 / 1000.0)
                         } else {
-                            format!(" Lyrics - {} [{}] ", e.title, tags.join(" "))
+                            format!(" Lyrics - {} ", e.title)
                         }
                     })
                     .unwrap_or_else(|| " Lyrics ".to_string());
@@ -3185,7 +3239,7 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 f.render_widget(lrc_widget, lrc_area);
             }
 
-            // 3. Now Playing Progress Bar with Elapsed, Total, AND Time Left (-MM:SS left)
+            // 3. Now Playing Progress Bar (high-contrast crisp white text!)
             app.hits.progress_bar = outer[2];
             let np_ratio = if app.pb.dur > 0.1 {
                 (app.smooth_pos / app.pb.dur).clamp(0.0, 1.0)
@@ -3216,20 +3270,25 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                     format!("{} {}{}{}   0:00 / --:--", icon, e.title, artist, liked_mark)
                 }
             } else {
-                "Idle - click a song or press Enter".to_string()
+                "Idle".to_string()
             };
             let np_gauge = Gauge::default()
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Now Playing (click bar to seek) "),
+                .block(Block::default().borders(Borders::ALL).title(" Now Playing "))
+                .gauge_style(
+                    Style::default()
+                        .fg(Color::Rgb(68, 152, 92))
+                        .bg(Color::Rgb(36, 38, 44)),
                 )
-                .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
                 .ratio(np_ratio)
-                .label(np_label);
+                .label(Span::styled(
+                    np_label,
+                    Style::default()
+                        .fg(Color::Rgb(248, 248, 250))
+                        .add_modifier(Modifier::BOLD),
+                ));
             f.render_widget(np_gauge, outer[2]);
 
-            // 4. Clean Simplistic Clickable Controls Bar (ZERO emojis!)
+            // 4. Clean Simplistic Clickable Controls Bar
             app.hits.controls_bar = outer[3];
             let is_playing = app.pb.active && !app.pb.paused;
             let cur_liked = app.current_track_entry().map(|e| e.liked).unwrap_or(false);
@@ -3292,18 +3351,16 @@ fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
                 ("[+]".into(), Style::default().fg(Color::White), Some(ButtonAction::VolUp)),
             ];
 
-            let ctrl_line = render_inline_buttons(btn_defs, outer[3], &mut app.hits.buttons);
+            let ctrl_line = render_inline_buttons(btn_defs, outer[3], 1, &mut app.hits.buttons);
             let ctrl_bar = Paragraph::new(ctrl_line)
                 .block(Block::default().borders(Borders::ALL).title(" Controls "));
             f.render_widget(ctrl_bar, outer[3]);
 
             // 5. Status / Input Prompt
             let bottom = match &app.input_mode {
-                InputMode::Search => Paragraph::new(
-                    "Type song, artist, or Spotify/YouTube URL in the top Search bar -> Enter or click [ Search ] | Esc cancel",
-                )
-                .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL)),
+                InputMode::Search => Paragraph::new("Searching... (Enter to submit, Esc to cancel)")
+                    .style(Style::default().fg(Color::Rgb(118, 238, 148)))
+                    .block(Block::default().borders(Borders::ALL)),
                 InputMode::Import => Paragraph::new(format!(
                     "Spotify URL, YouTube URL, Exportify .csv, or local path: {}_",
                     app.input_buf
