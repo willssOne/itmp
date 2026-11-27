@@ -4,17 +4,16 @@ A lightweight, fast, low-memory Spotify-style terminal music player written in R
 
 ## Features
 
-- **In-app Search & Download**: Always-visible search bar (`/`) to search YouTube, download audio + album cover art + synced `.lrc` lyrics, and play immediately.
-- **500 MB LRU Audio Cache**: Automatically prunes least-recently-used tracks when the cache exceeds the limit (`ITMP_CACHE_MB`, default `500 MB`). Liked songs (`*`) are pinned and protected from eviction.
+- **Spotify-Style Top Bar**: `[ itmp ]` home button, always-visible Search bar + `[ Search ]` button, and `[ Settings ]` button right at the top.
+- **Visual In-App Search**: Search songs and artists with `4x2` truecolor thumbnails next to every result, `[CACHED]` indicators, and clickable artist names.
+- **Spotify Artist Profiles & Liked Artists**: Click any artist name (in Library, Search, Now Playing, or press `A`) to load their profile, avatar, and Top Tracks from Spotify; like/follow artists (`f`) to pin them under `Artists` in your Library sidebar.
+- **Settings Menu (`,`)**: Manage your LRU audio cache (gauge, `-100 MB` / `+100 MB` limit adjuster, manual prune) and link Spotify playlists/albums, CSV/JSON exports, or OAuth PKCE login in one place.
 - **Live Word-by-Word Synced Lyrics**:
   - Audio-envelope vocal alignment (`300–1900 Hz` via `ffmpeg`) tracks vocal bursts and breath pauses.
   - **Parallel same-line adlibs**: Parenthesized adlibs `( ... )` animate on their own timeline simultaneously alongside main vocals on the same line.
   - Live per-track sync nudge (`[` / `]` / `\`) saved automatically.
-- **Album Art in Terminal**: Truecolor half-block (`▀`) album cover art plus compact `4x2` thumbnails next to every track.
-- **Spotify Import & OAuth PKCE Login**:
-  - **Free (no Premium needed)**: Paste any public Spotify playlist, album, or track URL (or Exportify `.csv` / Spotify Privacy `.json` export) directly in the `Spotify` tab (`p`) to browse, play, or bulk-import.
-  - **OAuth 2.0 PKCE Login** (for Spotify Premium developer accounts): Browse Liked Songs, Private Playlists, Saved Albums, Recently Played, and Top Tracks.
-- **Mouse & Keyboard Controls**: Clickable Play/Pause, Prev, Next, Shuffle, Repeat, Like, Import, Lyrics toggle, Volume `[-]`/`[+]`, and click-to-seek progress bar with elapsed, total, and `-MM:SS left` countdown.
+- **Album Art in Terminal**: Truecolor half-block (`▀`) album cover art plus compact `4x2` thumbnails next to every track and search result.
+- **Mouse & Keyboard Controls**: Clickable Play/Pause, Prev, Next, Shuffle, Repeat, Like, Artist, Lyrics toggle, Volume `[-]`/`[+]`, and click-to-seek progress bar with elapsed, total, and `-MM:SS left` countdown.
 - **Minimal ASCII UI**: Clean terminal interface with no emojis or heavy GUI frameworks.
 
 ## Requirements
@@ -62,7 +61,9 @@ itmp
 | `r` | Cycle Repeat (`off` / `all` / `one`) |
 | `l` | Like / Pin track (protects from 500 MB LRU eviction) |
 | `/` or `s` | Focus top Search bar |
-| `S` | Open Spotify tab (`p` add playlist/album URL or CSV/JSON, `a` import all) |
+| `A` or Click Artist | Open Spotify Artist Profile (avatar + top tracks) |
+| `f` | Like / Follow artist (on Artist Profile -> pins to Library sidebar) |
+| `,` | Open Settings (Cache gauge/limit + Spotify playlist linking & OAuth) |
 | `i` | Import Spotify URL, YouTube URL, CSV/JSON export, or local files/folder |
 | `L` | Toggle live synced lyrics pane |
 | `[` / `]` / `\` | Nudge lyric sync `-50ms` / `+50ms` / reset (saved per track) |

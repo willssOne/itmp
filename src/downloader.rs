@@ -39,7 +39,7 @@ pub fn search_youtube(query: &str) -> Result<Vec<SearchResult>, String> {
     let target = if query.starts_with("http://") || query.starts_with("https://") {
         query.to_string()
     } else {
-        format!("ytsearch10:{query}")
+        format!("ytsearch12:{query}")
     };
     let out = Command::new("yt-dlp")
         .args([
@@ -65,11 +65,12 @@ pub fn search_youtube(query: &str) -> Result<Vec<SearchResult>, String> {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty() && *s != "NA")
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+                .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg"));
+            let uploader = crate::cache::clean_artist_name(parts[2]);
             results.push(SearchResult {
                 id,
                 duration: parts[1].trim().to_string(),
-                uploader: parts[2].trim().to_string(),
+                uploader,
                 title: parts[3].trim().to_string(),
                 thumbnail: thumb,
             });

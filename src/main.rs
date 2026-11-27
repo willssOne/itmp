@@ -1,3 +1,4 @@
+mod artist;
 mod cache;
 mod cover;
 mod downloader;
@@ -5,12 +6,13 @@ mod lyrics;
 mod player;
 mod spotify;
 
+use artist::{fetch_artist_profile, parse_spotify_artist_id, ArtistProfile};
 use cache::{
-    add_track_to_playlist, audio_dir, fmt_mb, fmt_time, has_lrc, load_and_sync_library, now_ts,
-    prune_lru, remove_track_files, save_library, total_cache_bytes, Library, Playlist, TrackEntry,
-    DEFAULT_MAX_MB,
+    add_track_to_playlist, audio_dir, clean_artist_name, find_cached_track, fmt_mb, fmt_time,
+    has_lrc, load_and_sync_library, now_ts, prune_lru, remove_track_files, save_library,
+    total_cache_bytes, Library, LikedArtist, Playlist, TrackEntry, DEFAULT_MAX_MB,
 };
-use cover::{CoverArt, ThumbCache};
+use cover::{decode_thumb, fetch_remote_image_to_temp, CoverArt, ThumbCache, ThumbRows};
 use downloader::{
     download_and_cache_track, expand_local_path, fetch_spotify_metadata, import_local_music,
     parse_spotify_export_file, search_youtube, SearchResult, SpotifyTrackSpec,
@@ -57,12 +59,24 @@ enum Focus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum View {
-    Search,
-    Spotify,
     AllTracks,
     Liked,
     Queue,
     Playlist(usize),
+    Search,
+    Artist,
+    Settings,
+}
+
+#[derive(Debug, Clone)]
+enum SidebarEntry {
+    AllTracks,
+    Liked,
+    Queue,
+    Header,
+    Artist(usize),
+    Playlist(usize),
+    NewPlaylist,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +117,7 @@ enum InputMode {
 enum WorkerMsg {
     Progress(String),
     SearchDone(Result<Vec<SearchResult>, String>),
+    ThumbReady(String, ThumbRows),
     DownloadDone(Result<(String, String), String>, bool), // (filename, msg), auto_play
     ImportDone(Result<String, String>),
     LyricsAligned(String, Vec<LrcLine>),
@@ -110,10 +125,15 @@ enum WorkerMsg {
     SpotifyCollectionsDone(Result<Vec<SpotifyCollection>, String>),
     SpotifyTracksDone(Result<(SpotifyCollection, Vec<SpotifyTrackSpec>), String>),
     SpotifyPublicUrlAdded(Result<(SavedSpotifyLink, Vec<SpotifyTrackSpec>), String>),
+    ArtistLoaded(Result<ArtistProfile, String>),
+    ArtistAvatarReady(String, PathBuf),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ButtonAction {
+    Home,
+    SearchBtn,
+    Settings,
     Prev,
     PlayPause,
     Next,
@@ -123,8 +143,18 @@ enum ButtonAction {
     VolDown,
     VolUp,
     Import,
-    Search,
     ToggleLyrics,
+    CacheDec,
+    CacheInc,
+    PruneCache,
+    SpotifyAddUrl,
+    SpotifyLoginPrompt,
+    SpotifyDashboard,
+    SpotifyRefresh,
+    SpotifyLogout,
+    ToggleLikeArtist,
+    ArtistImportAll,
+    OpenCurrentArtist,
 }
 
 #[derive(Default)]
@@ -132,6 +162,7 @@ struct HitAreas {
     search_box: Rect,
     sidebar: Rect,
     track_list: Rect,
+    settings_list: Rect,
     progress_bar: Rect,
     controls_bar: Rect,
     buttons: Vec<(Rect, ButtonAction)>,
@@ -175,12 +206,21 @@ struct App {
     search_state: ListState,
     playlist_pick_state: ListState,
 
+    // Spotify linking & playlist browser (lives in Settings!)
     spotify: SpotifySession,
     spotify_cols: Vec<SpotifyCollection>,
     spotify_col_state: ListState,
     spotify_open_col: Option<SpotifyCollection>,
     spotify_tracks: Vec<SpotifyTrackSpec>,
     spotify_track_state: ListState,
+
+    // Artist Profile (Spotify + discography)
+    artist_profile: Option<ArtistProfile>,
+    artist_loading_name: Option<String>,
+    artist_avatar_path: Option<PathBuf>,
+    artist_avatar_art: Option<CoverArt>,
+    artist_avatar_size: (u16, u16),
+    artist_track_state: ListState,
 
     hits: HitAreas,
     last_click: Option<(usize, Instant)>,
@@ -192,12 +232,16 @@ struct App {
 }
 
 impl App {
-    fn new(max_mb: u64) -> Self {
+    fn new(env_max_mb: Option<u64>) -> Self {
         let dir = audio_dir();
         let lib = load_and_sync_library(&dir);
+        let max_mb = env_max_mb
+            .or(lib.max_cache_mb)
+            .unwrap_or(DEFAULT_MAX_MB)
+            .clamp(100, 10_000);
         let (tx, rx) = mpsc::channel();
         let mut sidebar_state = ListState::default();
-        sidebar_state.select(Some(2)); // Start on All Tracks (index 2, below / Search & Spotify)
+        sidebar_state.select(Some(0)); // All Tracks
         let spotify = load_spotify_session();
         let initial_sp_cols = saved_links_as_collections(&spotify);
         let mut initial_sp_state = ListState::default();
@@ -244,9 +288,15 @@ impl App {
             spotify_open_col: None,
             spotify_tracks: Vec::new(),
             spotify_track_state: ListState::default(),
+            artist_profile: None,
+            artist_loading_name: None,
+            artist_avatar_path: None,
+            artist_avatar_art: None,
+            artist_avatar_size: (0, 0),
+            artist_track_state: ListState::default(),
             hits: HitAreas::default(),
             last_click: None,
-            status: "Space play/pause | Enter play | / search | i import | z shuffle | r repeat | l like | L lyrics | q quit".into(),
+            status: "Space play | Enter play | / search | A artist | , settings | l like | L lyrics | [ ] sync | q quit".into(),
             busy: false,
             tx,
             rx,
@@ -267,57 +317,84 @@ impl App {
         (x as usize) % bound
     }
 
-    fn sidebar_items(&self) -> Vec<(String, View)> {
+    fn sidebar_rows(&self) -> Vec<(String, SidebarEntry)> {
         let liked_count = self.lib.entries.values().filter(|e| e.liked).count();
-        let sp_label = if self.spotify.is_logged_in() {
-            "Spotify (*) ".to_string()
-        } else {
-            "Spotify Login".to_string()
-        };
-        let mut items = vec![
-            ("/ Search".to_string(), View::Search),
-            (sp_label, View::Spotify),
-            (format!("All Tracks ({})", self.lib.entries.len()), View::AllTracks),
-            (format!("* Liked ({})", liked_count), View::Liked),
-            (format!("Queue ({})", self.queue.len()), View::Queue),
+        let mut rows = vec![
+            (
+                format!("All Tracks ({})", self.lib.entries.len()),
+                SidebarEntry::AllTracks,
+            ),
+            (
+                format!("* Liked Songs ({})", liked_count),
+                SidebarEntry::Liked,
+            ),
+            (
+                format!("Queue ({})", self.queue.len()),
+                SidebarEntry::Queue,
+            ),
         ];
-        for (idx, pl) in self.lib.playlists.iter().enumerate() {
-            items.push((format!("- {} ({})", pl.name, pl.tracks.len()), View::Playlist(idx)));
+
+        rows.push(("-- Artists --".to_string(), SidebarEntry::Header));
+        if self.lib.liked_artists.is_empty() {
+            rows.push(("  (none liked)".to_string(), SidebarEntry::Header));
+        } else {
+            for (idx, ar) in self.lib.liked_artists.iter().enumerate() {
+                rows.push((format!("* {}", ar.name), SidebarEntry::Artist(idx)));
+            }
         }
-        items
+
+        rows.push(("-- Playlists --".to_string(), SidebarEntry::Header));
+        for (idx, pl) in self.lib.playlists.iter().enumerate() {
+            rows.push((
+                format!("- {} ({})", pl.name, pl.tracks.len()),
+                SidebarEntry::Playlist(idx),
+            ));
+        }
+        rows.push(("+ New Playlist".to_string(), SidebarEntry::NewPlaylist));
+        rows
     }
 
-    fn sync_view_from_sidebar(&mut self) {
-        let items = self.sidebar_items();
-        if let Some(i) = self.sidebar_state.selected() {
-            if let Some((_, v)) = items.get(i) {
-                self.view = v.clone();
-                if matches!(self.view, View::Search) {
-                    if self.search_results.is_empty() {
-                        self.input_mode = InputMode::Search;
-                    } else {
-                        self.input_mode = InputMode::SearchResults;
-                    }
-                } else if matches!(self.view, View::Spotify) {
-                    if matches!(self.input_mode, InputMode::Search | InputMode::SearchResults) {
-                        self.input_mode = InputMode::Normal;
-                    }
-                    if self.spotify.is_logged_in() && self.spotify_cols.is_empty() && !self.busy {
-                        self.start_spotify_load_collections();
-                    }
-                } else {
-                    if matches!(self.input_mode, InputMode::Search | InputMode::SearchResults) {
-                        self.input_mode = InputMode::Normal;
-                    }
-                    self.rebuild_track_list();
+    fn activate_sidebar_index(&mut self, idx: usize) {
+        let rows = self.sidebar_rows();
+        let Some((_, entry)) = rows.get(idx) else {
+            return;
+        };
+        match entry {
+            SidebarEntry::Header => return,
+            SidebarEntry::AllTracks => {
+                self.view = View::AllTracks;
+                self.input_mode = InputMode::Normal;
+                self.rebuild_track_list();
+            }
+            SidebarEntry::Liked => {
+                self.view = View::Liked;
+                self.input_mode = InputMode::Normal;
+                self.rebuild_track_list();
+            }
+            SidebarEntry::Queue => {
+                self.view = View::Queue;
+                self.input_mode = InputMode::Normal;
+                self.rebuild_track_list();
+            }
+            SidebarEntry::Artist(aidx) => {
+                if let Some(ar) = self.lib.liked_artists.get(*aidx).cloned() {
+                    self.open_artist_profile(&ar.name, ar.spotify_id.as_deref());
                 }
+            }
+            SidebarEntry::Playlist(pidx) => {
+                self.view = View::Playlist(*pidx);
+                self.input_mode = InputMode::Normal;
+                self.rebuild_track_list();
+            }
+            SidebarEntry::NewPlaylist => {
+                self.input_buf.clear();
+                self.input_mode = InputMode::NewPlaylist;
             }
         }
     }
 
     fn rebuild_track_list(&mut self) {
         let list: Vec<String> = match &self.view {
-            View::Search | View::Spotify => Vec::new(),
             View::AllTracks => {
                 let mut keys: Vec<String> = self.lib.entries.keys().cloned().collect();
                 keys.sort_by(|a, b| {
@@ -345,6 +422,7 @@ impl App {
                 .get(*idx)
                 .map(|p| p.tracks.clone())
                 .unwrap_or_default(),
+            View::Search | View::Artist | View::Settings => Vec::new(),
         };
         self.track_list = list;
         if self.track_list.is_empty() {
@@ -364,7 +442,7 @@ impl App {
         if let View::Playlist(idx) = self.view {
             if idx >= self.lib.playlists.len() {
                 self.view = View::AllTracks;
-                self.sidebar_state.select(Some(2));
+                self.sidebar_state.select(Some(0));
             }
         }
         self.rebuild_track_list();
@@ -448,7 +526,7 @@ impl App {
             if let Some(e) = self.lib.entries.get_mut(&fname) {
                 e.liked = !e.liked;
                 let st = if e.liked {
-                    "Liked (pinned from 500 MB LRU eviction)"
+                    "Liked (pinned from LRU eviction)"
                 } else {
                     "Unliked"
                 };
@@ -460,17 +538,153 @@ impl App {
         }
     }
 
+    fn is_artist_liked(&self, name: &str) -> bool {
+        let target = name.trim().to_ascii_lowercase();
+        self.lib
+            .liked_artists
+            .iter()
+            .any(|a| a.name.trim().to_ascii_lowercase() == target)
+    }
+
+    fn toggle_like_current_artist(&mut self) {
+        let Some(prof) = self.artist_profile.clone() else {
+            return;
+        };
+        let target = prof.name.trim().to_ascii_lowercase();
+        if let Some(pos) = self
+            .lib
+            .liked_artists
+            .iter()
+            .position(|a| a.name.trim().to_ascii_lowercase() == target)
+        {
+            self.lib.liked_artists.remove(pos);
+            save_library(&self.dir, &self.lib);
+            self.status = format!("Removed '{}' from Liked Artists", prof.name);
+        } else {
+            self.lib.liked_artists.push(LikedArtist {
+                name: prof.name.clone(),
+                spotify_id: prof.spotify_id.clone(),
+                image_url: prof.image_url.clone(),
+            });
+            self.lib
+                .liked_artists
+                .sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()));
+            save_library(&self.dir, &self.lib);
+            self.status = format!("Liked artist '{}' (added to Library sidebar)", prof.name);
+        }
+    }
+
+    fn open_artist_profile(&mut self, raw_name: &str, known_spotify_id: Option<&str>) {
+        let cleaned = clean_artist_name(raw_name);
+        let direct_id = parse_spotify_artist_id(raw_name).or_else(|| known_spotify_id.map(|s| s.to_string()));
+        if cleaned.is_empty() && direct_id.is_none() {
+            self.status = "No artist metadata on this track".into();
+            return;
+        }
+        let lookup = if direct_id.is_some() {
+            raw_name.to_string()
+        } else {
+            cleaned.clone()
+        };
+        let label = if cleaned.is_empty() {
+            "Spotify Artist".to_string()
+        } else {
+            cleaned.clone()
+        };
+
+        // Check if we already have a stored spotify_id for this liked artist
+        let saved_id = direct_id.or_else(|| {
+            self.lib
+                .liked_artists
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&label))
+                .and_then(|a| a.spotify_id.clone())
+        });
+
+        self.view = View::Artist;
+        self.focus = Focus::Main;
+        self.input_mode = InputMode::Normal;
+        self.artist_loading_name = Some(label.clone());
+        self.artist_profile = None;
+        self.artist_avatar_path = None;
+        self.artist_avatar_art = None;
+        self.artist_track_state.select(None);
+        self.busy = true;
+        self.status = format!("Loading Spotify profile for '{label}'...");
+
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let res = fetch_artist_profile(&lookup, saved_id.as_deref());
+            if let Ok(ref prof) = res {
+                // Spawn avatar fetch in parallel
+                if let Some(img_url) = prof.image_url.clone() {
+                    let tx_av = tx.clone();
+                    let aname = prof.name.clone();
+                    thread::spawn(move || {
+                        if let Some(p) = fetch_remote_image_to_temp(&img_url, &format!("artist-{aname}")) {
+                            let _ = tx_av.send(WorkerMsg::ArtistAvatarReady(aname, p));
+                        }
+                    });
+                }
+                // Spawn background mini thumbnails for artist top tracks
+                let thumb_jobs: Vec<(String, String)> = prof
+                    .top_tracks
+                    .iter()
+                    .filter_map(|t| {
+                        let u = t.cover_url.as_ref()?;
+                        Some((format!("url:{u}"), u.clone()))
+                    })
+                    .collect();
+                spawn_thumb_fetcher(thumb_jobs, tx.clone());
+            }
+            let _ = tx.send(WorkerMsg::ArtistLoaded(res));
+        });
+    }
+
+    fn open_selected_or_playing_artist(&mut self) {
+        if matches!(self.input_mode, InputMode::SearchResults) || matches!(self.view, View::Search) {
+            if let Some(i) = self.search_state.selected() {
+                if let Some(item) = self.search_results.get(i).cloned() {
+                    self.open_artist_profile(&item.uploader, None);
+                    return;
+                }
+            }
+        }
+        if matches!(self.view, View::Settings) && self.spotify_open_col.is_some() {
+            if let Some(i) = self.spotify_track_state.selected() {
+                if let Some(tr) = self.spotify_tracks.get(i).cloned() {
+                    self.open_artist_profile(&tr.artist, None);
+                    return;
+                }
+            }
+        }
+        if let Some(fname) = self.selected_track() {
+            if let Some(e) = self.lib.entries.get(&fname) {
+                if !e.artist.trim().is_empty() {
+                    let a = e.artist.clone();
+                    self.open_artist_profile(&a, None);
+                    return;
+                }
+            }
+        }
+        if let Some(e) = self.current_track_entry() {
+            if !e.artist.trim().is_empty() {
+                let a = e.artist.clone();
+                self.open_artist_profile(&a, None);
+                return;
+            }
+        }
+        self.status = "No artist name available for this item".into();
+    }
+
     fn refresh_lyrics_for(&mut self, fname: &str) {
         if self.lrc_file.as_deref() == Some(fname) {
             return;
         }
-        // Instant initial load (syllable-paced + parallel same-line adlibs)
         self.lrc_lines = load_lrc(&self.dir, fname, None);
         self.lrc_file = Some(fname.to_string());
         self.lrc_audio_synced = false;
 
-        // Background audio-envelope alignment (~300ms): detects exact vocal bursts,
-        // breath pauses, and adlib tails from the real audio waveform.
         if !self.lrc_lines.is_empty() {
             let dir = self.dir.clone();
             let fname_owned = fname.to_string();
@@ -506,6 +720,15 @@ impl App {
         }
     }
 
+    fn adjust_cache_limit(&mut self, delta_mb: i64) {
+        let cur_mb = (self.max_bytes / 1_048_576) as i64;
+        let next_mb = (cur_mb + delta_mb).clamp(100, 10_000) as u64;
+        self.max_bytes = next_mb * 1_048_576;
+        self.lib.max_cache_mb = Some(next_mb);
+        save_library(&self.dir, &self.lib);
+        self.status = format!("Cache limit set to {} MB (saved)", next_mb);
+    }
+
     fn ensure_cover_art(&mut self, cols: u16, rows: u16) {
         if cols < 4 || rows < 2 {
             return;
@@ -531,6 +754,23 @@ impl App {
         }
         self.cover_art = CoverArt::load(&path, cols, rows);
         self.cover_size = (cols, rows);
+    }
+
+    fn ensure_artist_avatar(&mut self, cols: u16, rows: u16) {
+        if cols < 4 || rows < 2 {
+            return;
+        }
+        let Some(path) = self.artist_avatar_path.clone() else {
+            return;
+        };
+        let key = path.to_string_lossy().to_string();
+        if let Some(existing) = &self.artist_avatar_art {
+            if existing.path_key == key && self.artist_avatar_size == (cols, rows) {
+                return;
+            }
+        }
+        self.artist_avatar_art = CoverArt::load(&path, cols, rows);
+        self.artist_avatar_size = (cols, rows);
     }
 
     fn play_next(&mut self) {
@@ -632,19 +872,26 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 WorkerMsg::Progress(p) => self.status = p,
+                WorkerMsg::ThumbReady(key, rows) => {
+                    self.thumbs.insert(key, rows);
+                }
                 WorkerMsg::SearchDone(Ok(list)) => {
                     self.busy = false;
                     if list.is_empty() {
-                        self.status = "No results found. Press / to search again.".into();
+                        self.status = "No results found. Click Search or press / to try again.".into();
                         self.input_mode = InputMode::Normal;
                     } else {
+                        let jobs: Vec<(String, String)> = list
+                            .iter()
+                            .map(|r| (format!("yt:{}", r.id), r.thumbnail.clone()))
+                            .collect();
+                        spawn_thumb_fetcher(jobs, self.tx.clone());
                         self.search_results = list;
                         self.search_state.select(Some(0));
                         self.view = View::Search;
-                        self.sidebar_state.select(Some(0));
                         self.focus = Focus::Main;
                         self.input_mode = InputMode::SearchResults;
-                        self.status = "Enter/Click: download & play | d: download only | /: new search | Esc: back".into();
+                        self.status = "Enter/Click: Play & Save | Click Artist or press A: Spotify Profile | d: Download | /: New".into();
                     }
                 }
                 WorkerMsg::SearchDone(Err(e)) => {
@@ -685,7 +932,7 @@ impl App {
                     self.spotify = sess;
                     self.spotify_open_col = None;
                     self.spotify_tracks.clear();
-                    self.status = format!("Logged in to Spotify as {who} -- loading your library...");
+                    self.status = format!("Logged in to Spotify as {who} -- loading library...");
                     self.start_spotify_load_collections();
                 }
                 WorkerMsg::SpotifyLoginDone(Err(e)) => {
@@ -697,13 +944,10 @@ impl App {
                     let n = cols.len();
                     self.spotify_cols = cols;
                     self.spotify_col_state.select(if n > 0 { Some(0) } else { None });
-                    self.status = format!(
-                        "Loaded {n} Spotify collections (Enter/Click to open, R refresh, X logout)"
-                    );
+                    self.status = format!("Loaded {n} Spotify collections in Settings");
                 }
                 WorkerMsg::SpotifyCollectionsDone(Err(e)) => {
                     self.busy = false;
-                    // Keep any saved public links accessible even if Developer API returns 403 Premium required
                     self.spotify_cols = saved_links_as_collections(&self.spotify);
                     if !self.spotify_cols.is_empty() {
                         self.spotify_col_state.select(Some(0));
@@ -718,7 +962,7 @@ impl App {
                     self.spotify_tracks = tracks;
                     self.spotify_track_state.select(if n > 0 { Some(0) } else { None });
                     self.status = format!(
-                        "Spotify '{name}' ({n} tracks): Enter/Click play & save | d download | a import all | Esc back"
+                        "Spotify '{name}' ({n} tracks): Enter/Click play | d download | a import all | Esc back"
                     );
                 }
                 WorkerMsg::SpotifyTracksDone(Err(e)) => {
@@ -745,7 +989,7 @@ impl App {
                     self.spotify_tracks = tracks;
                     self.spotify_track_state.select(if n > 0 { Some(0) } else { None });
                     self.status = format!(
-                        "Added '{}' ({n} tracks)! Enter/Click play & save | d download | a import all | Esc back",
+                        "Linked '{}' ({n} tracks)! Enter/Click play & save | a import all | Esc back",
                         link.name
                     );
                 }
@@ -753,18 +997,44 @@ impl App {
                     self.busy = false;
                     self.status = format!("Spotify link error: {e}");
                 }
+                WorkerMsg::ArtistLoaded(Ok(prof)) => {
+                    self.busy = false;
+                    self.artist_loading_name = None;
+                    let n = prof.top_tracks.len();
+                    let name = prof.name.clone();
+                    self.artist_track_state.select(if n > 0 { Some(0) } else { None });
+                    self.artist_profile = Some(prof);
+                    self.status = format!(
+                        "Artist '{name}' ({n} top tracks): Enter/Click play | f like artist | d download | a import all"
+                    );
+                }
+                WorkerMsg::ArtistLoaded(Err(e)) => {
+                    self.busy = false;
+                    self.artist_loading_name = None;
+                    self.status = format!("Artist lookup failed: {e}");
+                }
+                WorkerMsg::ArtistAvatarReady(name, path) => {
+                    if self
+                        .artist_profile
+                        .as_ref()
+                        .map(|p| p.name == name)
+                        .unwrap_or(false)
+                    {
+                        self.artist_avatar_path = Some(path);
+                        self.artist_avatar_art = None;
+                    }
+                }
             }
         }
     }
 
-    fn open_spotify_view(&mut self) {
-        self.view = View::Spotify;
-        self.sidebar_state.select(Some(1));
+    fn open_settings_view(&mut self) {
+        self.view = View::Settings;
         self.focus = Focus::Main;
         if matches!(self.input_mode, InputMode::Search | InputMode::SearchResults) {
             self.input_mode = InputMode::Normal;
         }
-        if self.spotify.is_logged_in() && self.spotify_cols.is_empty() && !self.busy {
+        if self.spotify.is_logged_in() && self.spotify_cols.len() <= self.spotify.saved_links.len() && !self.busy {
             self.start_spotify_load_collections();
         }
     }
@@ -793,7 +1063,7 @@ impl App {
             return;
         }
         self.busy = true;
-        self.status = "Loading your Spotify Liked Songs, playlists & albums...".into();
+        self.status = "Loading Spotify playlists & library...".into();
         let mut sess = self.spotify.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -828,6 +1098,10 @@ impl App {
             self.input_mode = InputMode::Normal;
             return;
         }
+        if parse_spotify_artist_id(&input).is_some() {
+            self.open_artist_profile(&input, None);
+            return;
+        }
         let local = expand_local_path(&input);
         if local.is_file() {
             if let Some(bundle) = parse_spotify_export_file(&local) {
@@ -841,6 +1115,7 @@ impl App {
                     },
                 };
                 let n = bundle.tracks.len();
+                self.view = View::Settings;
                 self.spotify_open_col = Some(col);
                 self.spotify_tracks = bundle.tracks;
                 self.spotify_track_state.select(if n > 0 { Some(0) } else { None });
@@ -854,7 +1129,8 @@ impl App {
         }
         self.busy = true;
         self.input_mode = InputMode::Normal;
-        self.status = "Loading Spotify playlist/album/track link (no Premium needed)...".into();
+        self.view = View::Settings;
+        self.status = "Linking Spotify playlist/album (no Premium needed)...".into();
         let tx = self.tx.clone();
         thread::spawn(move || {
             let res = fetch_spotify_metadata(&input).map(|b| {
@@ -872,12 +1148,18 @@ impl App {
     }
 
     fn start_spotify_download_track(&mut self, idx: usize, auto_play: bool) {
-        if self.busy {
-            return;
-        }
         let Some(tr) = self.spotify_tracks.get(idx).cloned() else {
             return;
         };
+        if auto_play {
+            if let Some(cached) = find_cached_track(&self.lib, &tr.title, &tr.artist) {
+                self.play_filename(&cached, true);
+                return;
+            }
+        }
+        if self.busy {
+            return;
+        }
         let col = self.spotify_open_col.clone();
         let is_liked_col = matches!(
             col.as_ref().map(|c| &c.kind),
@@ -890,6 +1172,36 @@ impl App {
             _ => None,
         });
         let fallback_cover = col.and_then(|c| c.cover_url);
+        self.spawn_spec_download(tr, fallback_cover, pl_name, is_liked_col, auto_play);
+    }
+
+    fn start_artist_download_track(&mut self, idx: usize, auto_play: bool) {
+        let Some(prof) = self.artist_profile.clone() else {
+            return;
+        };
+        let Some(tr) = prof.top_tracks.get(idx).cloned() else {
+            return;
+        };
+        if auto_play {
+            if let Some(cached) = find_cached_track(&self.lib, &tr.title, &tr.artist) {
+                self.play_filename(&cached, true);
+                return;
+            }
+        }
+        if self.busy {
+            return;
+        }
+        self.spawn_spec_download(tr, prof.image_url, None, false, auto_play);
+    }
+
+    fn spawn_spec_download(
+        &mut self,
+        tr: SpotifyTrackSpec,
+        fallback_cover: Option<String>,
+        pl_name: Option<String>,
+        mark_liked: bool,
+        auto_play: bool,
+    ) {
         self.busy = true;
         self.status = format!(
             "Downloading '{} - {}'{}...",
@@ -913,7 +1225,7 @@ impl App {
                 pl_name.as_deref(),
                 max_bytes,
             );
-            if is_liked_col {
+            if mark_liked {
                 if let Ok((ref fname, _)) = res {
                     let mut lib = load_and_sync_library(&dir);
                     if let Some(e) = lib.entries.get_mut(fname) {
@@ -941,8 +1253,39 @@ impl App {
         };
         let fallback_cover = col.cover_url.clone();
         let col_label = col.name.clone();
+        self.spawn_bulk_import(tracks, fallback_cover, pl_name, is_liked_col, col_label);
+    }
+
+    fn start_artist_import_all(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(prof) = self.artist_profile.clone() else {
+            return;
+        };
+        if prof.top_tracks.is_empty() {
+            return;
+        }
+        let label = format!("{} Top Tracks", prof.name);
+        self.spawn_bulk_import(
+            prof.top_tracks,
+            prof.image_url,
+            Some(label.clone()),
+            false,
+            label,
+        );
+    }
+
+    fn spawn_bulk_import(
+        &mut self,
+        tracks: Vec<SpotifyTrackSpec>,
+        fallback_cover: Option<String>,
+        pl_name: Option<String>,
+        mark_liked: bool,
+        col_label: String,
+    ) {
         self.busy = true;
-        self.status = format!("Importing {} tracks from Spotify '{}'...", tracks.len(), col_label);
+        self.status = format!("Importing {} tracks from '{}'...", tracks.len(), col_label);
         let dir = self.dir.clone();
         let max_bytes = self.max_bytes;
         let tx = self.tx.clone();
@@ -951,7 +1294,7 @@ impl App {
             let mut ok_count = 0usize;
             for (idx, tr) in tracks.iter().enumerate() {
                 let _ = tx.send(WorkerMsg::Progress(format!(
-                    "Spotify [{}/{}] Downloading {} - {}...",
+                    "Import [{}/{}] Downloading {} - {}...",
                     idx + 1,
                     total,
                     tr.artist,
@@ -969,7 +1312,7 @@ impl App {
                     pl_name.as_deref(),
                     max_bytes,
                 ) {
-                    if is_liked_col {
+                    if mark_liked {
                         let mut lib = load_and_sync_library(&dir);
                         if let Some(e) = lib.entries.get_mut(&fname) {
                             e.liked = true;
@@ -979,7 +1322,7 @@ impl App {
                     ok_count += 1;
                 }
             }
-            let summary = if is_liked_col {
+            let summary = if mark_liked {
                 format!("Imported {ok_count}/{total} tracks into * Liked")
             } else {
                 format!("Imported {ok_count}/{total} tracks into playlist '{col_label}'")
@@ -989,12 +1332,19 @@ impl App {
     }
 
     fn logout_spotify(&mut self) {
+        let kept_links = self.spotify.saved_links.clone();
         clear_spotify_session();
-        self.spotify = SpotifySession::default();
-        self.spotify_cols.clear();
+        self.spotify = SpotifySession {
+            saved_links: kept_links,
+            ..Default::default()
+        };
+        if !self.spotify.saved_links.is_empty() {
+            let _ = save_spotify_session(&self.spotify);
+        }
+        self.spotify_cols = saved_links_as_collections(&self.spotify);
         self.spotify_open_col = None;
         self.spotify_tracks.clear();
-        self.status = "Logged out of Spotify.".into();
+        self.status = "Logged out of Spotify OAuth (saved public links kept).".into();
     }
 
     fn start_youtube_search(&mut self) {
@@ -1008,6 +1358,10 @@ impl App {
             }
             return;
         }
+        if parse_spotify_artist_id(&q).is_some() {
+            self.open_artist_profile(&q, None);
+            return;
+        }
         if q.contains("open.spotify.com/") || q.starts_with("spotify:") || expand_local_path(&q).exists() {
             self.start_smart_import(q);
             return;
@@ -1015,10 +1369,10 @@ impl App {
         self.last_search_query = q.clone();
         self.search_results.clear();
         self.view = View::Search;
-        self.sidebar_state.select(Some(0));
+        self.focus = Focus::Main;
         self.busy = true;
         self.input_mode = InputMode::Normal;
-        self.status = format!("Searching YouTube for '{q}'...");
+        self.status = format!("Searching for '{q}'...");
         let tx = self.tx.clone();
         thread::spawn(move || {
             let _ = tx.send(WorkerMsg::SearchDone(search_youtube(&q)));
@@ -1032,6 +1386,15 @@ impl App {
         let Some(item) = self.search_results.get(i).cloned() else {
             return;
         };
+        if auto_play {
+            if let Some(cached) = find_cached_track(&self.lib, &item.title, &item.uploader) {
+                self.play_filename(&cached, true);
+                return;
+            }
+        }
+        if self.busy {
+            return;
+        }
         self.busy = true;
         self.status = format!(
             "Downloading '{}'{}...",
@@ -1062,6 +1425,10 @@ impl App {
         let input = raw.trim().to_string();
         if input.is_empty() {
             self.input_mode = InputMode::Normal;
+            return;
+        }
+        if parse_spotify_artist_id(&input).is_some() {
+            self.open_artist_profile(&input, None);
             return;
         }
         self.busy = true;
@@ -1220,6 +1587,25 @@ impl App {
 
     fn trigger_button(&mut self, action: ButtonAction) {
         match action {
+            ButtonAction::Home => {
+                self.view = View::AllTracks;
+                self.sidebar_state.select(Some(0));
+                self.input_mode = InputMode::Normal;
+                self.focus = Focus::Main;
+                self.rebuild_track_list();
+            }
+            ButtonAction::SearchBtn => {
+                if matches!(self.input_mode, InputMode::Search) && !self.input_buf.trim().is_empty() {
+                    self.start_youtube_search();
+                } else if !self.busy {
+                    self.input_buf.clear();
+                    self.view = View::Search;
+                    self.focus = Focus::Main;
+                    self.input_mode = InputMode::Search;
+                    self.status = "Type song name, artist, or Spotify/YouTube URL -> press Enter or click [ Search ]".into();
+                }
+            }
+            ButtonAction::Settings => self.open_settings_view(),
             ButtonAction::Prev => self.play_prev(),
             ButtonAction::PlayPause => self.toggle_play_or_start(),
             ButtonAction::Next => self.play_next(),
@@ -1246,16 +1632,6 @@ impl App {
                     self.input_mode = InputMode::Import;
                 }
             }
-            ButtonAction::Search => {
-                if !self.busy {
-                    self.input_buf.clear();
-                    self.view = View::Search;
-                    self.sidebar_state.select(Some(0));
-                    self.focus = Focus::Main;
-                    self.input_mode = InputMode::Search;
-                    self.status = "Type song name, artist, or URL and press Enter to search".into();
-                }
-            }
             ButtonAction::ToggleLyrics => {
                 self.show_lyrics_pane = !self.show_lyrics_pane;
                 self.status = format!(
@@ -1263,6 +1639,48 @@ impl App {
                     if self.show_lyrics_pane { "on" } else { "off" }
                 );
             }
+            ButtonAction::CacheDec => self.adjust_cache_limit(-100),
+            ButtonAction::CacheInc => self.adjust_cache_limit(100),
+            ButtonAction::PruneCache => {
+                let (n, freed) = prune_lru(&self.dir, &mut self.lib, self.max_bytes);
+                self.rebuild_track_list();
+                self.status = if n > 0 {
+                    format!("Pruned {n} tracks (freed {})", fmt_mb(freed))
+                } else {
+                    format!(
+                        "Cache under {} ({})",
+                        fmt_mb(self.max_bytes),
+                        fmt_mb(total_cache_bytes(&self.lib))
+                    )
+                };
+            }
+            ButtonAction::SpotifyAddUrl => {
+                if !self.busy {
+                    self.input_buf.clear();
+                    self.input_mode = InputMode::SpotifyAddUrl;
+                }
+            }
+            ButtonAction::SpotifyLoginPrompt => {
+                if !self.busy {
+                    self.input_buf = self.spotify.client_id.clone();
+                    self.input_mode = InputMode::SpotifyClientId;
+                }
+            }
+            ButtonAction::SpotifyDashboard => {
+                open_url_in_browser("https://developer.spotify.com/dashboard");
+                self.status = format!(
+                    "Opened Spotify Dashboard -- set Redirect URI to {SPOTIFY_REDIRECT_URI}, then click OAuth Login"
+                );
+            }
+            ButtonAction::SpotifyRefresh => {
+                self.spotify_open_col = None;
+                self.spotify_tracks.clear();
+                self.start_spotify_load_collections();
+            }
+            ButtonAction::SpotifyLogout => self.logout_spotify(),
+            ButtonAction::ToggleLikeArtist => self.toggle_like_current_artist(),
+            ButtonAction::ArtistImportAll => self.start_artist_import_all(),
+            ButtonAction::OpenCurrentArtist => self.open_selected_or_playing_artist(),
         }
     }
 
@@ -1293,12 +1711,20 @@ impl App {
                     }
                 }
 
-                // Click the always-visible top Search bar anytime!
+                // Click top Search box anytime
                 if rect_contains(self.hits.search_box, col, row) {
-                    self.trigger_button(ButtonAction::Search);
+                    if !self.busy {
+                        self.view = View::Search;
+                        self.focus = Focus::Main;
+                        if !matches!(self.input_mode, InputMode::Search) {
+                            self.input_buf.clear();
+                            self.input_mode = InputMode::Search;
+                        }
+                    }
                     return;
                 }
 
+                // Click progress bar to seek
                 let pb = self.hits.progress_bar;
                 if self.pb.active && pb.width > 2 && rect_contains(pb, col, row) {
                     let inner_x = col.saturating_sub(pb.x + 1);
@@ -1321,29 +1747,64 @@ impl App {
                     return;
                 }
 
+                // Click sidebar
                 let sb = self.hits.sidebar;
-                if matches!(self.input_mode, InputMode::Normal | InputMode::SearchResults | InputMode::Search)
-                    && rect_contains(sb, col, row)
+                if matches!(
+                    self.input_mode,
+                    InputMode::Normal | InputMode::SearchResults | InputMode::Search
+                ) && rect_contains(sb, col, row)
                 {
                     let rel_y = row.saturating_sub(sb.y + 1) as usize;
                     let idx = self.sidebar_state.offset() + rel_y;
-                    if idx < self.sidebar_items().len() {
-                        self.focus = Focus::Sidebar;
-                        self.sidebar_state.select(Some(idx));
-                        self.sync_view_from_sidebar();
+                    let rows = self.sidebar_rows();
+                    if let Some((_, entry)) = rows.get(idx) {
+                        if !matches!(entry, SidebarEntry::Header) {
+                            self.focus = Focus::Sidebar;
+                            self.sidebar_state.select(Some(idx));
+                            self.activate_sidebar_index(idx);
+                        }
                     }
                     return;
                 }
 
+                // Click Settings Spotify collections / tracks list
+                if matches!(self.view, View::Settings) && rect_contains(self.hits.settings_list, col, row) {
+                    let sl = self.hits.settings_list;
+                    let rel_y = row.saturating_sub(sl.y + 1) as usize;
+                    self.focus = Focus::Main;
+                    if self.spotify_open_col.is_some() {
+                        let idx = self.spotify_track_state.offset() + rel_y;
+                        if idx < self.spotify_tracks.len() {
+                            self.spotify_track_state.select(Some(idx));
+                            self.start_spotify_download_track(idx, true);
+                        }
+                    } else {
+                        let idx = self.spotify_col_state.offset() + rel_y;
+                        if idx < self.spotify_cols.len() {
+                            self.spotify_col_state.select(Some(idx));
+                            self.start_spotify_open_collection(idx);
+                        }
+                    }
+                    return;
+                }
+
+                // Click Main Track / Search / Artist Track list
                 let tl = self.hits.track_list;
                 if rect_contains(tl, col, row) {
                     let rel_y = row.saturating_sub(tl.y + 1) as usize;
+                    let rel_x = col.saturating_sub(tl.x + 1);
                     match &self.input_mode {
                         InputMode::SearchResults => {
-                            let idx = self.search_state.offset() + rel_y;
+                            // Search rows are 2 lines tall with 4x2 thumbnail
+                            let idx = self.search_state.offset() + (rel_y / 2);
+                            let on_line2 = (rel_y % 2) == 1;
                             if idx < self.search_results.len() {
                                 self.search_state.select(Some(idx));
-                                if !self.busy {
+                                if on_line2 && rel_x >= 6 {
+                                    // Clicked the artist line -> load Artist Profile from Spotify!
+                                    let artist = self.search_results[idx].uploader.clone();
+                                    self.open_artist_profile(&artist, None);
+                                } else {
                                     self.start_download_search_result(true);
                                 }
                             }
@@ -1360,30 +1821,55 @@ impl App {
                             }
                         }
                         InputMode::Normal => {
-                            if matches!(self.view, View::Spotify) {
-                                self.focus = Focus::Main;
-                                if self.spotify_open_col.is_some() {
-                                    let idx = self.spotify_track_state.offset() + rel_y;
-                                    if idx < self.spotify_tracks.len() {
-                                        self.spotify_track_state.select(Some(idx));
-                                        self.start_spotify_download_track(idx, true);
-                                    }
-                                } else if !self.spotify_cols.is_empty() {
-                                    let idx = self.spotify_col_state.offset() + rel_y;
-                                    if idx < self.spotify_cols.len() {
-                                        self.spotify_col_state.select(Some(idx));
-                                        self.start_spotify_open_collection(idx);
-                                    }
-                                } else if !self.busy {
-                                    self.input_buf.clear();
-                                    self.input_mode = InputMode::SpotifyAddUrl;
+                            if matches!(self.view, View::Artist) {
+                                // Artist top tracks are 2 lines tall with 4x2 album thumbnail
+                                let idx = self.artist_track_state.offset() + (rel_y / 2);
+                                let total = self
+                                    .artist_profile
+                                    .as_ref()
+                                    .map(|p| p.top_tracks.len())
+                                    .unwrap_or(0);
+                                if idx < total {
+                                    self.focus = Focus::Main;
+                                    self.artist_track_state.select(Some(idx));
+                                    self.start_artist_download_track(idx, true);
                                 }
                                 return;
                             }
-                            // Each track row is 2 terminal lines tall (with its 4x2 album thumbnail)
+                            if matches!(self.view, View::Search) && !self.search_results.is_empty() {
+                                let idx = self.search_state.offset() + (rel_y / 2);
+                                let on_line2 = (rel_y % 2) == 1;
+                                if idx < self.search_results.len() {
+                                    self.input_mode = InputMode::SearchResults;
+                                    self.search_state.select(Some(idx));
+                                    if on_line2 && rel_x >= 6 {
+                                        let artist = self.search_results[idx].uploader.clone();
+                                        self.open_artist_profile(&artist, None);
+                                    } else {
+                                        self.start_download_search_result(true);
+                                    }
+                                }
+                                return;
+                            }
+                            // Library track rows: 2 lines tall with 4x2 thumbnail
                             let idx = self.track_state.offset() + (rel_y / 2);
+                            let on_line2 = (rel_y % 2) == 1;
                             if idx < self.track_list.len() {
                                 self.focus = Focus::Main;
+                                let fname = self.track_list[idx].clone();
+                                // Check if user clicked the Artist name on line 2!
+                                if on_line2 {
+                                    if let Some(e) = self.lib.entries.get(&fname) {
+                                        let artist_clean = clean_artist_name(&e.artist);
+                                        let artist_len = artist_clean.chars().count() as u16;
+                                        // Line 2 layout: "| " (2) + thumb (4) + " " (1) + "   " (3) = col 10 start
+                                        if artist_len > 0 && rel_x >= 9 && rel_x <= 10 + artist_len + 1 {
+                                            self.track_state.select(Some(idx));
+                                            self.open_artist_profile(&artist_clean, None);
+                                            return;
+                                        }
+                                    }
+                                }
                                 let already_sel = self.track_state.selected() == Some(idx);
                                 let quick_repeat = self
                                     .last_click
@@ -1392,13 +1878,11 @@ impl App {
                                 self.track_state.select(Some(idx));
                                 self.last_click = Some((idx, Instant::now()));
                                 if already_sel || quick_repeat {
-                                    if let Some(fname) = self.track_list.get(idx).cloned() {
-                                        if matches!(self.view, View::Queue) {
-                                            self.queue.remove(idx);
-                                            self.rebuild_track_list();
-                                        }
-                                        self.play_filename(&fname, true);
+                                    if matches!(self.view, View::Queue) {
+                                        self.queue.remove(idx);
+                                        self.rebuild_track_list();
                                     }
+                                    self.play_filename(&fname, true);
                                 }
                             }
                         }
@@ -1432,18 +1916,39 @@ impl App {
             }
             InputMode::Normal => match self.focus {
                 Focus::Sidebar => {
-                    let items = self.sidebar_items();
-                    if items.is_empty() {
+                    let rows = self.sidebar_rows();
+                    if rows.is_empty() {
                         return;
                     }
-                    let n = items.len() as isize;
-                    let cur = self.sidebar_state.selected().unwrap_or(0) as isize;
-                    let next = (cur + delta).rem_euclid(n) as usize;
-                    self.sidebar_state.select(Some(next));
-                    self.sync_view_from_sidebar();
+                    let n = rows.len() as isize;
+                    let mut idx = self.sidebar_state.selected().unwrap_or(0) as isize;
+                    let step = if delta >= 0 { 1 } else { -1 };
+                    for _ in 0..rows.len() {
+                        idx = (idx + step).rem_euclid(n);
+                        if !matches!(rows[idx as usize].1, SidebarEntry::Header) {
+                            self.sidebar_state.select(Some(idx as usize));
+                            if !matches!(rows[idx as usize].1, SidebarEntry::NewPlaylist | SidebarEntry::Artist(_)) {
+                                self.activate_sidebar_index(idx as usize);
+                            }
+                            break;
+                        }
+                    }
                 }
-                Focus::Main => {
-                    if matches!(self.view, View::Spotify) {
+                Focus::Main => match self.view {
+                    View::Artist => {
+                        let total = self
+                            .artist_profile
+                            .as_ref()
+                            .map(|p| p.top_tracks.len())
+                            .unwrap_or(0);
+                        if total > 0 {
+                            let n = total as isize;
+                            let cur = self.artist_track_state.selected().unwrap_or(0) as isize;
+                            self.artist_track_state
+                                .select(Some((cur + delta).rem_euclid(n) as usize));
+                        }
+                    }
+                    View::Settings => {
                         if self.spotify_open_col.is_some() {
                             if !self.spotify_tracks.is_empty() {
                                 let n = self.spotify_tracks.len() as isize;
@@ -1457,16 +1962,25 @@ impl App {
                             self.spotify_col_state
                                 .select(Some((cur + delta).rem_euclid(n) as usize));
                         }
-                        return;
                     }
-                    if self.track_list.is_empty() {
-                        return;
+                    View::Search => {
+                        if !self.search_results.is_empty() {
+                            let n = self.search_results.len() as isize;
+                            let cur = self.search_state.selected().unwrap_or(0) as isize;
+                            self.search_state
+                                .select(Some((cur + delta).rem_euclid(n) as usize));
+                        }
                     }
-                    let n = self.track_list.len() as isize;
-                    let cur = self.track_state.selected().unwrap_or(0) as isize;
-                    self.track_state
-                        .select(Some((cur + delta).rem_euclid(n) as usize));
-                }
+                    _ => {
+                        if self.track_list.is_empty() {
+                            return;
+                        }
+                        let n = self.track_list.len() as isize;
+                        let cur = self.track_state.selected().unwrap_or(0) as isize;
+                        self.track_state
+                            .select(Some((cur + delta).rem_euclid(n) as usize));
+                    }
+                },
             },
             _ => {}
         }
@@ -1480,14 +1994,72 @@ impl App {
     }
 }
 
+fn spawn_thumb_fetcher(jobs: Vec<(String, String)>, tx: Sender<WorkerMsg>) {
+    if jobs.is_empty() {
+        return;
+    }
+    // Split across up to 4 lightweight worker threads so search/artist thumbnails pop in almost instantly
+    let worker_count = jobs.len().min(4);
+    let mut buckets: Vec<Vec<(String, String)>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (i, job) in jobs.into_iter().enumerate() {
+        buckets[i % worker_count].push(job);
+    }
+    for bucket in buckets {
+        let tx_c = tx.clone();
+        thread::spawn(move || {
+            for (key, url) in bucket {
+                if let Some(path) = fetch_remote_image_to_temp(&url, &key) {
+                    if let Some(rows) = decode_thumb(&path) {
+                        let _ = tx_c.send(WorkerMsg::ThumbReady(key, rows));
+                    }
+                }
+            }
+        });
+    }
+}
+
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
 }
 
-/// Renders word-by-word synced lyrics (no GPU shader — pure crisp terminal styling):
-/// - Main vocal active word: bold green with smooth character-by-character sweep
-/// - Parallel adlibs `( ... )`: bold yellow sweeping AT THE SAME TIME on the same line
-/// - Sung main words: bright white | Sung adlibs: yellow | Upcoming: dark gray
+fn fmt_fans(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M fans", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K fans", n as f64 / 1_000.0)
+    } else {
+        format!("{n} fans")
+    }
+}
+
+fn render_inline_buttons(
+    defs: Vec<(String, Style, Option<ButtonAction>)>,
+    area: Rect,
+    hits: &mut Vec<(Rect, ButtonAction)>,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut cursor_x = area.x + 1;
+    let max_x = area.x + area.width.saturating_sub(1);
+    let btn_y = area.y + 1;
+    for (label, style, action_opt) in defs {
+        let w = label.chars().count() as u16;
+        if cursor_x + w > max_x {
+            break;
+        }
+        if let Some(action) = action_opt {
+            hits.push((Rect::new(cursor_x, btn_y, w, 1), action));
+        }
+        spans.push(Span::styled(label, style));
+        cursor_x += w;
+        if cursor_x + 1 < max_x {
+            spans.push(Span::raw(" "));
+            cursor_x += 1;
+        }
+    }
+    Line::from(spans)
+}
+
+/// Word-by-word synced lyrics with simultaneous same-line adlibs (Green main, Yellow adlibs)
 fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let h = area_h.saturating_sub(2) as usize;
@@ -1536,9 +2108,6 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
             continue;
         }
 
-        // Build wrapped lines of word-by-word styled spans for the active bar.
-        // Main words and parenthesized adlibs are evaluated independently against `pos`
-        // so both can light up simultaneously on the exact same line!
         let mut current_row: Vec<Span<'static>> = Vec::new();
         let mut row_len = 0usize;
 
@@ -1568,7 +2137,6 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
             if pos >= w.end {
                 current_row.push(Span::styled(w.text.clone(), sung_style));
             } else if pos >= w.start - 0.02 {
-                // Smooth character-by-character sweep inside the word
                 let frac = ((pos - w.start) / dur).clamp(0.0, 1.0);
                 let split_at = ((w_len as f64) * frac).ceil().clamp(1.0, w_len as f64) as usize;
                 let lit: String = w_chars[..split_at].iter().collect();
@@ -1603,14 +2171,14 @@ fn render_word_synced_lyrics(app: &App, area_w: u16, area_h: u16) -> Vec<Line<'s
     lines
 }
 
-fn run_tui(max_mb: u64) -> io::Result<()> {
+fn run_tui(env_max_mb: Option<u64>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(max_mb);
+    let mut app = App::new(env_max_mb);
 
     loop {
         app.poll_worker();
@@ -1618,33 +2186,129 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
 
         terminal.draw(|f| {
             app.hits.buttons.clear();
+            app.hits.settings_list = Rect::default();
 
             let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3), // 0: Top cache bar
-                    Constraint::Min(10),   // 1: Body: sidebar+cover | tracks | live lyrics
+                    Constraint::Length(3), // 0: Spotify-style Top Bar ([ itmp ] | Search | [ Search ] | [ Settings ])
+                    Constraint::Min(10),   // 1: Body: Library+Cover | Main View | Live Lyrics
                     Constraint::Length(3), // 2: Now Playing progress + time left
-                    Constraint::Length(3), // 3: Clickable simplistic controls bar
-                    Constraint::Length(3), // 4: Status / input prompt
+                    Constraint::Length(3), // 3: Controls bar
+                    Constraint::Length(3), // 4: Status / Input prompt
                 ])
                 .split(f.area());
 
-            // 1. Top Cache Gauge
-            let used = total_cache_bytes(&app.lib);
-            let ratio = ((used as f64) / (app.max_bytes.max(1) as f64)).clamp(0.0, 1.0);
-            let top_label = format!(
-                "Cache: {} / {} ({} tracks)",
-                fmt_mb(used),
-                fmt_mb(app.max_bytes),
-                app.lib.entries.len(),
+            // 1. Spotify-style Top Navigation Bar
+            let top_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(10), // [ itmp ]
+                    Constraint::Min(20),    // Search input
+                    Constraint::Length(12), // [ Search ]
+                    Constraint::Length(14), // [ Settings ]
+                ])
+                .split(outer[0]);
+
+            let home_active = matches!(
+                app.view,
+                View::AllTracks | View::Liked | View::Queue | View::Playlist(_)
             );
-            let gauge = Gauge::default()
-                .block(Block::default().borders(Borders::ALL).title(" itmp "))
-                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-                .ratio(ratio)
-                .label(top_label);
-            f.render_widget(gauge, outer[0]);
+            let home_btn = Paragraph::new(" itmp ")
+                .alignment(Alignment::Center)
+                .style(if home_active {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if home_active {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }),
+                );
+            app.hits.buttons.push((top_cols[0], ButtonAction::Home));
+            f.render_widget(home_btn, top_cols[0]);
+
+            // Top Search input box
+            app.hits.search_box = top_cols[1];
+            let is_searching = matches!(app.input_mode, InputMode::Search);
+            let (search_text, search_style, search_border) = if is_searching {
+                (
+                    format!(" / {}_", app.input_buf),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Green),
+                )
+            } else if !app.last_search_query.is_empty() && matches!(app.view, View::Search) {
+                (
+                    format!(" / {}", app.last_search_query),
+                    Style::default().fg(Color::White),
+                    Style::default().fg(Color::Green),
+                )
+            } else {
+                (
+                    " / Search songs, artists, or paste Spotify/YouTube URL...".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let search_box = Paragraph::new(search_text).style(search_style).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(search_border),
+            );
+            f.render_widget(search_box, top_cols[1]);
+
+            // Top [ Search ] button
+            let search_btn_active = is_searching || matches!(app.view, View::Search);
+            let search_btn = Paragraph::new(" Search ")
+                .alignment(Alignment::Center)
+                .style(if search_btn_active {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if search_btn_active {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }),
+                );
+            app.hits.buttons.push((top_cols[2], ButtonAction::SearchBtn));
+            f.render_widget(search_btn, top_cols[2]);
+
+            // Top [ Settings ] button
+            let settings_active = matches!(app.view, View::Settings);
+            let settings_btn = Paragraph::new(" Settings ")
+                .alignment(Alignment::Center)
+                .style(if settings_active {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(if settings_active {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        }),
+                );
+            app.hits.buttons.push((top_cols[3], ButtonAction::Settings));
+            f.render_widget(settings_btn, top_cols[3]);
 
             // 2. Body split
             let body = Layout::default()
@@ -1654,16 +2318,30 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
 
             let left = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(5), Constraint::Length(12)])
+                .constraints([Constraint::Min(6), Constraint::Length(12)])
                 .split(body[0]);
 
             app.hits.sidebar = left[0];
 
-            // Sidebar (simplistic, zero emoji)
-            let sb_items: Vec<ListItem> = app
-                .sidebar_items()
-                .into_iter()
-                .map(|(label, _)| ListItem::new(label))
+            // Clean Spotify-style Library Sidebar (Tracks, Liked, Queue, Liked Artists, Playlists)
+            let sb_rows = app.sidebar_rows();
+            let sb_items: Vec<ListItem> = sb_rows
+                .iter()
+                .map(|(label, entry)| match entry {
+                    SidebarEntry::Header => ListItem::new(Span::styled(
+                        label.clone(),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    SidebarEntry::Artist(_) => ListItem::new(Span::styled(
+                        label.clone(),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                    SidebarEntry::NewPlaylist => ListItem::new(Span::styled(
+                        label.clone(),
+                        Style::default().fg(Color::Green),
+                    )),
+                    _ => ListItem::new(label.clone()),
+                })
                 .collect();
             let sb_border = if app.focus == Focus::Sidebar {
                 Style::default().fg(Color::Yellow)
@@ -1711,64 +2389,23 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
             };
             f.render_widget(cov_widget, left[1]);
 
-            // Right side: always-visible Search bar on top + (Tracks/Search Results | Live Lyrics) below
-            let right_rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(7)])
-                .split(body[1]);
-
-            app.hits.search_box = right_rows[0];
-            let is_searching = matches!(app.input_mode, InputMode::Search);
-            let search_title = if is_searching {
-                " Search (Enter to search, Esc to cancel) "
-            } else {
-                " Search (click or press / to find & download songs) "
-            };
-            let (search_text, search_style, search_border) = if is_searching {
-                (
-                    format!("/ {}_", app.input_buf),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::Green),
-                )
-            } else if !app.last_search_query.is_empty() && matches!(app.view, View::Search) {
-                (
-                    format!("/ {}  (press / or click to search again)", app.last_search_query),
-                    Style::default().fg(Color::White),
-                    Style::default().fg(Color::Green),
-                )
-            } else {
-                (
-                    "/ Search songs, artists, or paste Spotify/YouTube URL...".to_string(),
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::DarkGray),
-                )
-            };
-            let search_widget = Paragraph::new(search_text)
-                .style(search_style)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(search_border)
-                        .title(search_title),
-                );
-            f.render_widget(search_widget, right_rows[0]);
-
-            let (main_area, lyrics_area_opt) = if app.show_lyrics_pane {
-                if right_rows[1].width >= 78 {
+            // Right area: Main View + optional Live Lyrics pane
+            let (main_area, lyrics_area_opt) = if app.show_lyrics_pane && !matches!(app.view, View::Settings) {
+                if body[1].width >= 78 {
                     let cols = Layout::default()
                         .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-                        .split(right_rows[1]);
+                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .split(body[1]);
                     (cols[0], Some(cols[1]))
                 } else {
                     let rows = Layout::default()
                         .direction(Direction::Vertical)
-                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                        .split(right_rows[1]);
+                        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                        .split(body[1]);
                     (rows[0], Some(rows[1]))
                 }
             } else {
-                (right_rows[1], None)
+                (body[1], None)
             };
 
             app.hits.track_list = main_area;
@@ -1806,7 +2443,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                     let msg = if app.busy {
                         format!("\n  Searching for '{}'...", app.last_search_query)
                     } else {
-                        "\n  Type a song name or artist in the Search bar above and press Enter.\n  You can also paste a Spotify or YouTube link.\n\n  Results will appear here -- press Enter or click any song to download & play,\n  or press d to download it to your 500 MB cache in the background.".to_string()
+                        "\n  Type a song name, artist, or paste a Spotify / YouTube link in the top Search bar.\n\n  - Click any song or press Enter to download & play\n  - Click the artist name (cyan) or press A to open their Spotify Artist Profile\n  - Press d to download in background without interrupting playback".to_string()
                     };
                     let empty_search = Paragraph::new(msg)
                         .style(Style::default().fg(if app.busy { Color::Yellow } else { Color::Gray }))
@@ -1815,25 +2452,58 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
-                                .title(" Search & Download "),
+                                .title(" Search "),
                         );
                     f.render_widget(empty_search, main_area);
                 } else {
+                    let title_max = main_area.width.saturating_sub(24).clamp(16, 48) as usize;
                     let items: Vec<ListItem> = app
                         .search_results
                         .iter()
                         .map(|r| {
-                            ListItem::new(Line::from(vec![
-                                Span::styled(
-                                    format!("[{:>5}] ", r.duration),
-                                    Style::default().fg(Color::Green),
-                                ),
-                                Span::raw(format!("{} ", r.title)),
-                                Span::styled(
-                                    format!("- {}", r.uploader),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                            ]))
+                            let thumb_key = format!("yt:{}", r.id);
+                            let thumb_rows = app.thumbs.get_by_key(&thumb_key).cloned();
+                            let cached = find_cached_track(&app.lib, &r.title, &r.uploader).is_some();
+
+                            let mut l1: Vec<Span<'static>> = Vec::new();
+                            let mut l2: Vec<Span<'static>> = Vec::new();
+                            if let Some([t0, t1]) = thumb_rows {
+                                l1.extend(t0);
+                                l2.extend(t1);
+                            } else {
+                                l1.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                                l2.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                            }
+                            l1.push(Span::raw(" "));
+                            l2.push(Span::raw(" "));
+
+                            let mut t_disp = r.title.clone();
+                            if t_disp.chars().count() > title_max {
+                                t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
+                            }
+                            l1.push(Span::styled(
+                                format!("[{:>5}] ", r.duration),
+                                Style::default().fg(Color::Green),
+                            ));
+                            l1.push(Span::styled(
+                                t_disp,
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ));
+                            if cached {
+                                l1.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            }
+
+                            l2.push(Span::styled("        ", Style::default()));
+                            l2.push(Span::styled(
+                                r.uploader.clone(),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                            l2.push(Span::styled(
+                                "  (click artist or press A for profile)",
+                                Style::default().fg(Color::DarkGray),
+                            ));
+
+                            ListItem::new(vec![Line::from(l1), Line::from(l2)])
                         })
                         .collect();
                     let list = List::new(items)
@@ -1842,20 +2512,317 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
                                 .title(format!(
-                                    " Results ({}) [Enter/Click: Play & Save | d: Download | /: New] ",
+                                    " Search Results ({}) [Enter: Play | A/Click Artist: Profile | d: Dl] ",
                                     app.search_results.len()
                                 )),
                         )
                         .highlight_style(
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Green)
+                                .bg(Color::DarkGray)
                                 .add_modifier(Modifier::BOLD),
                         )
-                        .highlight_symbol("+ ");
+                        .highlight_symbol("| ");
                     f.render_stateful_widget(list, main_area, &mut app.search_state);
                 }
-            } else if matches!(app.view, View::Spotify) {
+            } else if matches!(app.view, View::Artist) {
+                let artist_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(9), Constraint::Min(6)])
+                    .split(main_area);
+
+                // Artist Profile Header (Avatar + Info + Like/Import buttons)
+                let hdr_cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(18), Constraint::Min(24)])
+                    .split(artist_rows[0]);
+
+                let av_w = hdr_cols[0].width.saturating_sub(2);
+                let av_h = hdr_cols[0].height.saturating_sub(2);
+                app.ensure_artist_avatar(av_w, av_h);
+                let av_widget = if let Some(art) = &app.artist_avatar_art {
+                    Paragraph::new(art.lines.clone())
+                        .alignment(Alignment::Center)
+                        .block(Block::default().borders(Borders::ALL).title(" Artist "))
+                } else {
+                    Paragraph::new("\n\n  Loading...")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .block(Block::default().borders(Borders::ALL).title(" Artist "))
+                };
+                f.render_widget(av_widget, hdr_cols[0]);
+
+                if let Some(prof) = &app.artist_profile {
+                    let liked = app.is_artist_liked(&prof.name);
+                    let cached_cnt = app
+                        .lib
+                        .entries
+                        .values()
+                        .filter(|e| {
+                            clean_artist_name(&e.artist)
+                                .to_ascii_lowercase()
+                                .contains(&prof.name.to_ascii_lowercase())
+                        })
+                        .count();
+
+                    let info_rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Length(4), Constraint::Length(3), Constraint::Min(2)])
+                        .split(hdr_cols[1]);
+
+                    let mut meta_lines = vec![Line::from(vec![
+                        Span::styled(
+                            format!(" {}", prof.name),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  [{}]", prof.source),
+                            Style::default().fg(Color::Green),
+                        ),
+                    ])];
+                    let mut sub = format!(" {} tracks cached locally", cached_cnt);
+                    if let Some(fans) = prof.fans {
+                        sub.push_str(&format!("  |  {}", fmt_fans(fans)));
+                    }
+                    meta_lines.push(Line::from(Span::styled(sub, Style::default().fg(Color::Gray))));
+                    if let Some(u) = &prof.spotify_url {
+                        meta_lines.push(Line::from(Span::styled(
+                            format!(" {u}"),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    let info_box = Paragraph::new(meta_lines)
+                        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(Color::Green)));
+                    f.render_widget(info_box, info_rows[0]);
+
+                    let btn_line = render_inline_buttons(
+                        vec![
+                            (
+                                if liked { "[ * Liked Artist ]".into() } else { "[ + Like Artist ]".into() },
+                                if liked {
+                                    Style::default()
+                                        .fg(Color::Black)
+                                        .bg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                                },
+                                Some(ButtonAction::ToggleLikeArtist),
+                            ),
+                            (
+                                "[ + Import Top Tracks ]".into(),
+                                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                                Some(ButtonAction::ArtistImportAll),
+                            ),
+                            (
+                                "[ Back ]".into(),
+                                Style::default().fg(Color::Gray),
+                                Some(ButtonAction::Home),
+                            ),
+                        ],
+                        info_rows[1],
+                        &mut app.hits.buttons,
+                    );
+                    let act_bar = Paragraph::new(btn_line)
+                        .block(Block::default().borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(Color::Green)));
+                    f.render_widget(act_bar, info_rows[1]);
+
+                    // Artist Top Tracks (2-line rows with 4x2 album cover art!)
+                    app.hits.track_list = artist_rows[1];
+                    let title_max = artist_rows[1].width.saturating_sub(24).clamp(16, 46) as usize;
+                    let items: Vec<ListItem> = prof
+                        .top_tracks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tr)| {
+                            let thumb_rows = tr
+                                .cover_url
+                                .as_ref()
+                                .and_then(|u| app.thumbs.get_by_key(&format!("url:{u}")))
+                                .cloned();
+                            let cached = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
+
+                            let mut l1: Vec<Span<'static>> = Vec::new();
+                            let mut l2: Vec<Span<'static>> = Vec::new();
+                            if let Some([t0, t1]) = thumb_rows {
+                                l1.extend(t0);
+                                l2.extend(t1);
+                            } else {
+                                l1.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                                l2.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                            }
+                            l1.push(Span::raw(" "));
+                            l2.push(Span::raw(" "));
+
+                            let mut t_disp = tr.title.clone();
+                            if t_disp.chars().count() > title_max {
+                                t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
+                            }
+                            l1.push(Span::styled(
+                                format!("{:>2}. ", i + 1),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                            l1.push(Span::styled(
+                                t_disp,
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ));
+                            if cached {
+                                l1.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            }
+
+                            let dur = if tr.duration_sec > 0 {
+                                fmt_time(tr.duration_sec as f64)
+                            } else {
+                                "--:--".to_string()
+                            };
+                            let mut sub = format!("    {}", tr.artist);
+                            if !tr.album.is_empty() {
+                                sub.push_str(&format!(" - {}", tr.album));
+                            }
+                            sub.push_str(&format!(" | {dur}"));
+                            l2.push(Span::styled(sub, Style::default().fg(Color::DarkGray)));
+
+                            ListItem::new(vec![Line::from(l1), Line::from(l2)])
+                        })
+                        .collect();
+
+                    let list = List::new(items)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(main_border)
+                                .title(format!(
+                                    " Top Tracks ({}) [Enter/Click: Play | d: Download | f: Like Artist | a: Import All] ",
+                                    prof.top_tracks.len()
+                                )),
+                        )
+                        .highlight_style(
+                            Style::default()
+                                .bg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("| ");
+                    f.render_stateful_widget(list, artist_rows[1], &mut app.artist_track_state);
+                } else {
+                    let loading_msg = app
+                        .artist_loading_name
+                        .as_deref()
+                        .map(|n| format!("\n  Loading Spotify profile for '{n}'..."))
+                        .unwrap_or_else(|| "\n  Click any artist name or press A on a song to view their Spotify profile.".into());
+                    let p = Paragraph::new(loading_msg)
+                        .style(Style::default().fg(Color::Yellow))
+                        .block(Block::default().borders(Borders::ALL).title(" Artist Profile "));
+                    f.render_widget(p, hdr_cols[1]);
+                }
+            } else if matches!(app.view, View::Settings) {
+                let s_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(8), Constraint::Min(10)])
+                    .split(main_area);
+
+                // Section 1: Audio Cache Settings (moved out of top bar!)
+                let cache_inner = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Length(2), Constraint::Length(3)])
+                    .split(s_rows[0]);
+
+                let used = total_cache_bytes(&app.lib);
+                let ratio = ((used as f64) / (app.max_bytes.max(1) as f64)).clamp(0.0, 1.0);
+                let gauge = Gauge::default()
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(" Settings: Audio Cache "),
+                    )
+                    .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                    .ratio(ratio)
+                    .label(format!(
+                        "{} / {} ({} tracks, {} liked/pinned)",
+                        fmt_mb(used),
+                        fmt_mb(app.max_bytes),
+                        app.lib.entries.len(),
+                        app.lib.entries.values().filter(|e| e.liked).count()
+                    ));
+                f.render_widget(gauge, cache_inner[0]);
+
+                let cache_path_p = Paragraph::new(format!(
+                    " Cache folder: {}  |  Limit: {} MB",
+                    app.dir.display(),
+                    app.max_bytes / 1_048_576
+                ))
+                .style(Style::default().fg(Color::Gray));
+                f.render_widget(cache_path_p, cache_inner[1]);
+
+                let cache_btns = render_inline_buttons(
+                    vec![
+                        ("[ -100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheDec)),
+                        ("[ +100 MB ]".into(), Style::default().fg(Color::White), Some(ButtonAction::CacheInc)),
+                        (
+                            "[ Prune LRU Now ]".into(),
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                            Some(ButtonAction::PruneCache),
+                        ),
+                        (
+                            "[ + Import URL / Folder ]".into(),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Some(ButtonAction::Import),
+                        ),
+                    ],
+                    cache_inner[2],
+                    &mut app.hits.buttons,
+                );
+                let cache_bar = Paragraph::new(cache_btns)
+                    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+                f.render_widget(cache_bar, cache_inner[2]);
+
+                // Section 2: Spotify Linking & Playlist Imports
+                let sp_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(6)])
+                    .split(s_rows[1]);
+
+                let mut sp_btn_defs = vec![(
+                    "[ + Link Spotify URL / CSV ]".into(),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Some(ButtonAction::SpotifyAddUrl),
+                )];
+                if app.spotify.is_logged_in() {
+                    sp_btn_defs.push((
+                        format!("Spotify: {}", app.spotify.display_name),
+                        Style::default().fg(Color::Gray),
+                        None,
+                    ));
+                    sp_btn_defs.push((
+                        "[ Refresh ]".into(),
+                        Style::default().fg(Color::White),
+                        Some(ButtonAction::SpotifyRefresh),
+                    ));
+                    sp_btn_defs.push((
+                        "[ Logout ]".into(),
+                        Style::default().fg(Color::Yellow),
+                        Some(ButtonAction::SpotifyLogout),
+                    ));
+                } else {
+                    sp_btn_defs.push((
+                        "[ OAuth Login (Premium) ]".into(),
+                        Style::default().fg(Color::Cyan),
+                        Some(ButtonAction::SpotifyLoginPrompt),
+                    ));
+                    sp_btn_defs.push((
+                        "[ Dashboard ]".into(),
+                        Style::default().fg(Color::Gray),
+                        Some(ButtonAction::SpotifyDashboard),
+                    ));
+                }
+                let sp_btn_line = render_inline_buttons(sp_btn_defs, sp_rows[0], &mut app.hits.buttons);
+                let sp_bar = Paragraph::new(sp_btn_line).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Green))
+                        .title(" Settings: Spotify Linking & Playlists "),
+                );
+                f.render_widget(sp_bar, sp_rows[0]);
+
+                app.hits.settings_list = sp_rows[1];
                 if let Some(col) = &app.spotify_open_col {
                     let items: Vec<ListItem> = app
                         .spotify_tracks
@@ -1866,17 +2833,16 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                             } else {
                                 "--:--".to_string()
                             };
-                            ListItem::new(Line::from(vec![
-                                Span::styled(
-                                    format!("[{:>5}] ", dur),
-                                    Style::default().fg(Color::Green),
-                                ),
+                            let cached = find_cached_track(&app.lib, &tr.title, &tr.artist).is_some();
+                            let mut spans = vec![
+                                Span::styled(format!("[{:>5}] ", dur), Style::default().fg(Color::Green)),
                                 Span::raw(format!("{} ", tr.title)),
-                                Span::styled(
-                                    format!("- {}", tr.artist),
-                                    Style::default().fg(Color::DarkGray),
-                                ),
-                            ]))
+                                Span::styled(format!("- {}", tr.artist), Style::default().fg(Color::Cyan)),
+                            ];
+                            if cached {
+                                spans.push(Span::styled(" [CACHED]", Style::default().fg(Color::Green)));
+                            }
+                            ListItem::new(Line::from(spans))
                         })
                         .collect();
                     let list = List::new(items)
@@ -1885,7 +2851,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
                                 .title(format!(
-                                    " Spotify: {} ({}) [Enter/Click: Play & Save | d: Dl | a: Import All | Esc: Back] ",
+                                    " Spotify: {} ({}) [Enter: Play | d: Dl | a: Import All | A: Artist | Esc: Back] ",
                                     col.name,
                                     app.spotify_tracks.len()
                                 )),
@@ -1897,8 +2863,22 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("+ ");
-                    f.render_stateful_widget(list, main_area, &mut app.spotify_track_state);
-                } else if !app.spotify_cols.is_empty() {
+                    f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_track_state);
+                } else if app.spotify_cols.is_empty() {
+                    let help = format!(
+                        "\n  No Spotify playlists linked yet.\n\n  FREE (No Spotify Premium needed):\n    Click [ + Link Spotify URL / CSV ] (or press p) and paste ANY Spotify\n    playlist, album, or track URL -- or an Exportify .csv / Spotify .json file.\n\n  SPOTIFY OAUTH LOGIN (Requires Spotify Premium for Developer API):\n    Click [ Dashboard ] (o) -> add Redirect URI: {SPOTIFY_REDIRECT_URI}\n    Then click [ OAuth Login ] (c) and paste your Client ID."
+                    );
+                    let p = Paragraph::new(help)
+                        .style(Style::default().fg(Color::Gray))
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::DarkGray))
+                                .title(" Linked Spotify Playlists "),
+                        );
+                    f.render_widget(p, sp_rows[1]);
+                } else {
                     let items: Vec<ListItem> = app
                         .spotify_cols
                         .iter()
@@ -1915,20 +2895,12 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                             ]))
                         })
                         .collect();
-                    let header = if app.spotify.is_logged_in() {
-                        format!(
-                            " Spotify - {} [Enter/Click: Open | p: Add URL/CSV | R: Refresh | X: Logout] ",
-                            app.spotify.display_name
-                        )
-                    } else {
-                        " Spotify [Enter/Click: Open | p: Add Playlist/Album URL or CSV | L-login: c] ".to_string()
-                    };
                     let list = List::new(items)
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Green))
-                                .title(header),
+                                .title(" Linked Spotify Playlists [Enter/Click: Open | p: Add URL/CSV | d: Unlink] "),
                         )
                         .highlight_style(
                             Style::default()
@@ -1937,159 +2909,140 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                 .add_modifier(Modifier::BOLD),
                         )
                         .highlight_symbol("> ");
-                    f.render_stateful_widget(list, main_area, &mut app.spotify_col_state);
-                } else {
-                    let login_text = if app.spotify.is_logged_in() {
-                        format!(
-                            "\n  Logged in as: {}\n\n  Note: Spotify blocks Developer Web API on free accounts (HTTP 403\n  Premium required). You can STILL import playlists & songs free:\n\n  [p] Add ANY Spotify Playlist / Album / Track URL (or Exportify .csv /\n      Spotify YourLibrary.json) -- saves right here with zero Premium!\n\n  [R] Retry Spotify API (if you have Spotify Premium)\n  [X] Log out of Spotify",
-                            app.spotify.display_name
-                        )
-                    } else {
-                        format!(
-                            "\n  Spotify Import & Login\n\n  FREE (No Premium needed):\n    Press [p] or click here to paste ANY Spotify Playlist / Album URL\n    or an Exportify .csv / Spotify Privacy .json export file.\n    It saves right here so you can browse, play, or press [a] to import all.\n\n  SPOTIFY ACCOUNT LOGIN (Requires Spotify Premium for Developer API):\n    1. Press [o] -> developer.spotify.com/dashboard\n       Add Redirect URI: {SPOTIFY_REDIRECT_URI}\n    2. Press [c] to paste your Client ID and log in via browser."
-                        )
-                    };
-                    let card = Paragraph::new(login_text)
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: false })
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::Green))
-                                .title(" Spotify [p: Add URL/CSV (Free) | c: OAuth Login (Premium) | o: Dashboard] "),
-                        );
-                    f.render_widget(card, main_area);
+                    f.render_stateful_widget(list, sp_rows[1], &mut app.spotify_col_state);
                 }
             } else {
-                    let pane_title = match &app.view {
-                        View::Search => " Search ".into(),
-                        View::Spotify => " Spotify ".into(),
-                        View::AllTracks => format!(" All Tracks ({}) ", app.track_list.len()),
-                        View::Liked => format!(" * Liked ({}) ", app.track_list.len()),
-                        View::Queue => format!(" Queue ({}) ", app.track_list.len()),
-                        View::Playlist(idx) => app
-                            .lib
-                            .playlists
-                            .get(*idx)
-                            .map(|p| format!(" {} ({}) ", p.name, p.tracks.len()))
-                            .unwrap_or_else(|| " Playlist ".into()),
-                    };
+                // Library Track Views: All Tracks / Liked Songs / Queue / Playlist
+                let pane_title = match &app.view {
+                    View::AllTracks => format!(" All Tracks ({})  [Click Artist or press A for Spotify profile] ", app.track_list.len()),
+                    View::Liked => format!(" * Liked Songs ({}) ", app.track_list.len()),
+                    View::Queue => format!(" Queue ({}) ", app.track_list.len()),
+                    View::Playlist(idx) => app
+                        .lib
+                        .playlists
+                        .get(*idx)
+                        .map(|p| format!(" {} ({}) ", p.name, p.tracks.len()))
+                        .unwrap_or_else(|| " Playlist ".into()),
+                    _ => " Tracks ".into(),
+                };
 
-                    // Pre-collect metadata so we can mutably borrow app.thumbs cleanly
-                    let cur_playing = app.player.current_file.clone();
-                    let is_paused = app.pb.paused;
-                    let row_data: Vec<(String, String, String, String, bool, bool, u64, u64, Option<PathBuf>)> = app
-                        .track_list
-                        .iter()
-                        .filter_map(|fname| {
-                            let e = app.lib.entries.get(fname)?;
-                            Some((
-                                fname.clone(),
-                                e.title.clone(),
-                                e.artist.clone(),
-                                e.album.clone(),
-                                e.liked,
-                                has_lrc(&app.dir, fname),
-                                e.duration_sec,
-                                e.size_bytes,
-                                app.cover_path_for(fname),
-                            ))
-                        })
-                        .collect();
+                let cur_playing = app.player.current_file.clone();
+                let is_paused = app.pb.paused;
+                let row_data: Vec<(String, String, String, String, bool, bool, u64, u64, Option<PathBuf>)> = app
+                    .track_list
+                    .iter()
+                    .filter_map(|fname| {
+                        let e = app.lib.entries.get(fname)?;
+                        Some((
+                            fname.clone(),
+                            e.title.clone(),
+                            clean_artist_name(&e.artist),
+                            e.album.clone(),
+                            e.liked,
+                            has_lrc(&app.dir, fname),
+                            e.duration_sec,
+                            e.size_bytes,
+                            app.cover_path_for(fname),
+                        ))
+                    })
+                    .collect();
 
-                    let title_max = main_area.width.saturating_sub(18).clamp(14, 34) as usize;
-                    let items: Vec<ListItem> = row_data
-                        .into_iter()
-                        .map(|(fname, title, artist, album, liked, lrc_ok, dur_sec, size_b, cov_p)| {
-                            let thumb_rows = cov_p
-                                .as_deref()
-                                .and_then(|p| app.thumbs.get_or_load(p))
-                                .cloned();
+                let title_max = main_area.width.saturating_sub(18).clamp(14, 38) as usize;
+                let items: Vec<ListItem> = row_data
+                    .into_iter()
+                    .map(|(fname, title, artist, album, liked, lrc_ok, dur_sec, size_b, cov_p)| {
+                        let thumb_rows = cov_p
+                            .as_deref()
+                            .and_then(|p| app.thumbs.get_or_load(p))
+                            .cloned();
 
-                            let mut line1_spans: Vec<Span<'static>> = Vec::new();
-                            let mut line2_spans: Vec<Span<'static>> = Vec::new();
+                        let mut line1_spans: Vec<Span<'static>> = Vec::new();
+                        let mut line2_spans: Vec<Span<'static>> = Vec::new();
 
-                            if let Some([t0, t1]) = thumb_rows {
-                                line1_spans.extend(t0);
-                                line2_spans.extend(t1);
-                            } else {
-                                line1_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
-                                line2_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
-                            }
-                            line1_spans.push(Span::raw(" "));
-                            line2_spans.push(Span::raw(" "));
+                        if let Some([t0, t1]) = thumb_rows {
+                            line1_spans.extend(t0);
+                            line2_spans.extend(t1);
+                        } else {
+                            line1_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                            line2_spans.push(Span::styled("    ", Style::default().bg(Color::DarkGray)));
+                        }
+                        line1_spans.push(Span::raw(" "));
+                        line2_spans.push(Span::raw(" "));
 
-                            let is_cur = cur_playing.as_deref() == Some(fname.as_str());
-                            let status_tag = if is_cur {
-                                if is_paused { "|| " } else { ">  " }
-                            } else if liked {
-                                "*  "
-                            } else {
-                                "   "
-                            };
-                            let tag_style = if is_cur {
+                        let is_cur = cur_playing.as_deref() == Some(fname.as_str());
+                        let status_tag = if is_cur {
+                            if is_paused { "|| " } else { ">  " }
+                        } else if liked {
+                            "*  "
+                        } else {
+                            "   "
+                        };
+                        let tag_style = if is_cur {
+                            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        } else if liked {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+
+                        let mut t_disp = title;
+                        if t_disp.chars().count() > title_max {
+                            t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
+                        }
+                        line1_spans.push(Span::styled(status_tag, tag_style));
+                        line1_spans.push(Span::styled(
+                            t_disp,
+                            if is_cur {
                                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                            } else if liked {
-                                Style::default().fg(Color::Yellow)
                             } else {
-                                Style::default().fg(Color::DarkGray)
-                            };
+                                Style::default().fg(Color::White)
+                            },
+                        ));
 
-                            let mut t_disp = title;
-                            if t_disp.chars().count() > title_max {
-                                t_disp = t_disp.chars().take(title_max - 1).collect::<String>() + "..";
-                            }
-                            line1_spans.push(Span::styled(status_tag, tag_style));
-                            line1_spans.push(Span::styled(
-                                t_disp,
-                                if is_cur {
-                                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(Color::White)
-                                },
+                        let dur_s = if dur_sec > 0 {
+                            fmt_time(dur_sec as f64)
+                        } else {
+                            "--:--".to_string()
+                        };
+                        let lrc_s = if lrc_ok { "LRC" } else { "---" };
+
+                        line2_spans.push(Span::raw("   "));
+                        if !artist.is_empty() {
+                            line2_spans.push(Span::styled(artist, Style::default().fg(Color::Cyan)));
+                            let rest = if !album.is_empty() {
+                                format!(" - {} | {} | {}", album, dur_s, lrc_s)
+                            } else {
+                                format!(" | {} | {}", dur_s, lrc_s)
+                            };
+                            line2_spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
+                        } else {
+                            line2_spans.push(Span::styled(
+                                format!("{} | {} | {}", dur_s, lrc_s, fmt_mb(size_b)),
+                                Style::default().fg(Color::DarkGray),
                             ));
+                        }
 
-                            let mut sub_parts = Vec::new();
-                            if !artist.is_empty() {
-                                sub_parts.push(artist);
-                            }
-                            if !album.is_empty() {
-                                sub_parts.push(album);
-                            }
-                            let dur_s = if dur_sec > 0 {
-                                fmt_time(dur_sec as f64)
-                            } else {
-                                "--:--".to_string()
-                            };
-                            let lrc_s = if lrc_ok { "LRC" } else { "---" };
-                            let sub_text = if sub_parts.is_empty() {
-                                format!("   {} | {} | {}", dur_s, lrc_s, fmt_mb(size_b))
-                            } else {
-                                format!("   {} | {} | {}", sub_parts.join(" - "), dur_s, lrc_s)
-                            };
-                            line2_spans.push(Span::styled(sub_text, Style::default().fg(Color::DarkGray)));
+                        ListItem::new(vec![Line::from(line1_spans), Line::from(line2_spans)])
+                    })
+                    .collect();
 
-                            ListItem::new(vec![Line::from(line1_spans), Line::from(line2_spans)])
-                        })
-                        .collect();
-
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .border_style(main_border)
-                                .title(pane_title),
-                        )
-                        .highlight_style(
-                            Style::default()
-                                .bg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .highlight_symbol("| ");
-                    f.render_stateful_widget(list, main_area, &mut app.track_state);
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(main_border)
+                            .title(pane_title),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("| ");
+                f.render_stateful_widget(list, main_area, &mut app.track_state);
             }
 
-            // Live Word-by-Word Synced Lyrics panel (no shader, pure crisp terminal tween)
+            // Live Word-by-Word Synced Lyrics panel (parallel adlibs, no shader)
             if let Some(lrc_area) = lyrics_area_opt {
                 let lrc_title = app
                     .current_track_entry()
@@ -2134,7 +3087,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                 let artist = if e.artist.is_empty() {
                     String::new()
                 } else {
-                    format!(" - {}", e.artist)
+                    format!(" - {}", clean_artist_name(&e.artist))
                 };
                 if app.pb.dur > 0.1 {
                     let left_sec = (app.pb.dur - app.smooth_pos).max(0.0);
@@ -2210,9 +3163,9 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                     Some(ButtonAction::Like),
                 ),
                 (
-                    "[ + Import ]".into(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    Some(ButtonAction::Import),
+                    "[ Artist ]".into(),
+                    Style::default().fg(Color::Cyan),
+                    Some(ButtonAction::OpenCurrentArtist),
                 ),
                 (
                     format!("[ Lrc: {} ]", if app.show_lyrics_pane { "on" } else { "off" }),
@@ -2228,38 +3181,20 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                 ("[+]".into(), Style::default().fg(Color::White), Some(ButtonAction::VolUp)),
             ];
 
-            let mut spans = Vec::new();
-            let mut cursor_x = outer[3].x + 1;
-            let max_x = outer[3].x + outer[3].width.saturating_sub(1);
-            let btn_y = outer[3].y + 1;
-            for (label, style, action_opt) in btn_defs {
-                let w = label.chars().count() as u16;
-                if cursor_x + w > max_x {
-                    break;
-                }
-                if let Some(action) = action_opt {
-                    app.hits.buttons.push((Rect::new(cursor_x, btn_y, w, 1), action));
-                }
-                spans.push(Span::styled(label, style));
-                cursor_x += w;
-                if cursor_x + 1 < max_x {
-                    spans.push(Span::raw(" "));
-                    cursor_x += 1;
-                }
-            }
-            let ctrl_bar = Paragraph::new(Line::from(spans))
+            let ctrl_line = render_inline_buttons(btn_defs, outer[3], &mut app.hits.buttons);
+            let ctrl_bar = Paragraph::new(ctrl_line)
                 .block(Block::default().borders(Borders::ALL).title(" Controls "));
             f.render_widget(ctrl_bar, outer[3]);
 
             // 5. Status / Input Prompt
             let bottom = match &app.input_mode {
                 InputMode::Search => Paragraph::new(
-                    "Type song name, artist, or Spotify/YouTube URL in the Search bar above -> Enter to search | Esc to cancel",
+                    "Type song, artist, or Spotify/YouTube URL in the top Search bar -> Enter or click [ Search ] | Esc cancel",
                 )
                 .style(Style::default().fg(Color::Green))
                 .block(Block::default().borders(Borders::ALL)),
                 InputMode::Import => Paragraph::new(format!(
-                    "Spotify URL, YouTube URL, or local file/folder path: {}_",
+                    "Spotify URL, YouTube URL, Exportify .csv, or local path: {}_",
                     app.input_buf
                 ))
                 .style(Style::default().fg(Color::Cyan))
@@ -2269,13 +3204,13 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                     app.input_buf
                 ))
                 .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title(" Spotify Login (Enter opens browser, Esc cancel) ")),
+                .block(Block::default().borders(Borders::ALL).title(" Spotify OAuth Login (Enter opens browser, Esc cancel) ")),
                 InputMode::SpotifyAddUrl => Paragraph::new(format!(
-                    "Paste Spotify playlist/album/track URL or Exportify .csv / .json path: {}_",
+                    "Paste Spotify playlist/album/artist URL or Exportify .csv/.json path: {}_",
                     app.input_buf
                 ))
                 .style(Style::default().fg(Color::Green))
-                .block(Block::default().borders(Borders::ALL).title(" Add Spotify Playlist/Album (Free, no Premium) ")),
+                .block(Block::default().borders(Borders::ALL).title(" Link Spotify Playlist / Album (Free, no Premium) ")),
                 InputMode::NewPlaylist => Paragraph::new(format!("New playlist name: {}_", app.input_buf))
                     .style(Style::default().fg(Color::Yellow))
                     .block(Block::default().borders(Borders::ALL).title(" Create Playlist (Enter save, Esc cancel) ")),
@@ -2304,7 +3239,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                     app.input_mode = InputMode::SearchResults;
                                 } else {
                                     app.view = View::AllTracks;
-                                    app.sidebar_state.select(Some(2));
+                                    app.sidebar_state.select(Some(0));
                                     app.input_mode = InputMode::Normal;
                                     app.rebuild_track_list();
                                 }
@@ -2391,27 +3326,21 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                         InputMode::SearchResults => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 app.view = View::AllTracks;
-                                app.sidebar_state.select(Some(2));
+                                app.sidebar_state.select(Some(0));
                                 app.input_mode = InputMode::Normal;
                                 app.rebuild_track_list();
                                 app.status = "Returned to All Tracks.".into();
                             }
                             KeyCode::Char('/') | KeyCode::Char('s') => {
-                                app.trigger_button(ButtonAction::Search);
+                                app.trigger_button(ButtonAction::SearchBtn);
                             }
+                            KeyCode::Char(',') => app.open_settings_view(),
                             KeyCode::Char(' ') => app.trigger_button(ButtonAction::PlayPause),
+                            KeyCode::Char('A') => app.open_selected_or_playing_artist(),
                             KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
                             KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
-                            KeyCode::Enter => {
-                                if !app.busy {
-                                    app.start_download_search_result(true);
-                                }
-                            }
-                            KeyCode::Char('d') => {
-                                if !app.busy {
-                                    app.start_download_search_result(false);
-                                }
-                            }
+                            KeyCode::Enter => app.start_download_search_result(true),
+                            KeyCode::Char('d') => app.start_download_search_result(false),
                             _ => {}
                         },
                         InputMode::AddToPlaylist(fname) => {
@@ -2428,7 +3357,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                             let pl_name = pl.name.clone();
                                             add_track_to_playlist(&mut app.lib, &pl_name, &fname);
                                             save_library(&app.dir, &app.lib);
-                                            self_status_msg(&mut app, format!("Added to playlist '{pl_name}'"));
+                                            app.status = format!("Added to playlist '{pl_name}'");
                                         }
                                     }
                                     app.input_mode = InputMode::Normal;
@@ -2459,62 +3388,65 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                             KeyCode::Char('[') => app.adjust_lrc_offset(Some(-50)),
                             KeyCode::Char(']') => app.adjust_lrc_offset(Some(50)),
                             KeyCode::Char('\\') => app.adjust_lrc_offset(None),
+                            KeyCode::Char(',') => app.open_settings_view(),
                             KeyCode::Char('i') => app.trigger_button(ButtonAction::Import),
-                            KeyCode::Char('S') => app.open_spotify_view(),
-                            KeyCode::Char('/') | KeyCode::Char('s') => app.trigger_button(ButtonAction::Search),
+                            KeyCode::Char('/') | KeyCode::Char('s') => app.trigger_button(ButtonAction::SearchBtn),
                             KeyCode::Char('l') => app.trigger_button(ButtonAction::Like),
-                            KeyCode::Char('p') if matches!(app.view, View::Spotify) => {
-                                if !app.busy {
-                                    app.input_buf.clear();
-                                    app.input_mode = InputMode::SpotifyAddUrl;
-                                }
+                            KeyCode::Char('A') => app.open_selected_or_playing_artist(),
+                            KeyCode::Char('f') if matches!(app.view, View::Artist) => {
+                                app.toggle_like_current_artist();
                             }
-                            KeyCode::Char('c') if matches!(app.view, View::Spotify) && !app.spotify.is_logged_in() => {
-                                if !app.busy {
-                                    app.input_buf = app.spotify.client_id.clone();
-                                    app.input_mode = InputMode::SpotifyClientId;
-                                }
+                            KeyCode::Char('a') if matches!(app.view, View::Artist) => {
+                                app.start_artist_import_all();
                             }
-                            KeyCode::Char('o') if matches!(app.view, View::Spotify) && !app.spotify.is_logged_in() => {
-                                open_url_in_browser("https://developer.spotify.com/dashboard");
-                                app.status = format!(
-                                    "Opened Spotify Dashboard -- set Redirect URI to {SPOTIFY_REDIRECT_URI}, then press [c]"
-                                );
+                            KeyCode::Char('p') if matches!(app.view, View::Settings) => {
+                                app.trigger_button(ButtonAction::SpotifyAddUrl);
                             }
-                            KeyCode::Char('R') if matches!(app.view, View::Spotify) && app.spotify.is_logged_in() => {
-                                app.spotify_open_col = None;
-                                app.spotify_tracks.clear();
-                                app.start_spotify_load_collections();
+                            KeyCode::Char('c') if matches!(app.view, View::Settings) && !app.spotify.is_logged_in() => {
+                                app.trigger_button(ButtonAction::SpotifyLoginPrompt);
                             }
-                            KeyCode::Char('X') if matches!(app.view, View::Spotify) && app.spotify.is_logged_in() => {
-                                app.logout_spotify();
+                            KeyCode::Char('o') if matches!(app.view, View::Settings) => {
+                                app.trigger_button(ButtonAction::SpotifyDashboard);
                             }
-                            KeyCode::Char('a') if matches!(app.view, View::Spotify) && app.spotify_open_col.is_some() => {
+                            KeyCode::Char('R') if matches!(app.view, View::Settings) && app.spotify.is_logged_in() => {
+                                app.trigger_button(ButtonAction::SpotifyRefresh);
+                            }
+                            KeyCode::Char('X') if matches!(app.view, View::Settings) && app.spotify.is_logged_in() => {
+                                app.trigger_button(ButtonAction::SpotifyLogout);
+                            }
+                            KeyCode::Char('a')
+                                if matches!(app.view, View::Settings) && app.spotify_open_col.is_some() =>
+                            {
                                 app.start_spotify_import_all();
                             }
-                            KeyCode::Esc | KeyCode::Backspace
-                                if matches!(app.view, View::Spotify) && app.spotify_open_col.is_some() =>
-                            {
-                                app.spotify_open_col = None;
-                                app.spotify_tracks.clear();
-                                app.status = "Back to Spotify library.".into();
+                            KeyCode::Esc | KeyCode::Backspace => {
+                                if matches!(app.view, View::Settings) && app.spotify_open_col.is_some() {
+                                    app.spotify_open_col = None;
+                                    app.spotify_tracks.clear();
+                                    app.status = "Back to Settings.".into();
+                                } else if matches!(app.view, View::Artist | View::Settings) {
+                                    app.trigger_button(ButtonAction::Home);
+                                }
                             }
                             KeyCode::Enter => {
                                 if app.focus == Focus::Sidebar {
-                                    app.sync_view_from_sidebar();
-                                    app.focus = Focus::Main;
-                                } else if matches!(app.view, View::Spotify) {
+                                    if let Some(idx) = app.sidebar_state.selected() {
+                                        app.activate_sidebar_index(idx);
+                                        app.focus = Focus::Main;
+                                    }
+                                } else if matches!(app.view, View::Artist) {
+                                    if let Some(i) = app.artist_track_state.selected() {
+                                        app.start_artist_download_track(i, true);
+                                    }
+                                } else if matches!(app.view, View::Settings) {
                                     if app.spotify_open_col.is_some() {
                                         if let Some(i) = app.spotify_track_state.selected() {
                                             app.start_spotify_download_track(i, true);
                                         }
-                                    } else if !app.spotify_cols.is_empty() {
-                                        if let Some(i) = app.spotify_col_state.selected() {
-                                            app.start_spotify_open_collection(i);
-                                        }
-                                    } else if !app.busy {
-                                        app.input_buf.clear();
-                                        app.input_mode = InputMode::SpotifyAddUrl;
+                                    } else if let Some(i) = app.spotify_col_state.selected() {
+                                        app.start_spotify_open_collection(i);
+                                    } else {
+                                        app.trigger_button(ButtonAction::SpotifyAddUrl);
                                     }
                                 } else if let Some(fname) = app.selected_track() {
                                     if matches!(app.view, View::Queue) {
@@ -2553,9 +3485,32 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('d') => {
-                                if matches!(app.view, View::Spotify) && app.spotify_open_col.is_some() {
-                                    if let Some(i) = app.spotify_track_state.selected() {
-                                        app.start_spotify_download_track(i, false);
+                                if matches!(app.view, View::Artist) {
+                                    if let Some(i) = app.artist_track_state.selected() {
+                                        app.start_artist_download_track(i, false);
+                                    }
+                                } else if matches!(app.view, View::Settings) {
+                                    if app.spotify_open_col.is_some() {
+                                        if let Some(i) = app.spotify_track_state.selected() {
+                                            app.start_spotify_download_track(i, false);
+                                        }
+                                    } else if let Some(i) = app.spotify_col_state.selected() {
+                                        if let Some(SpotifyCollection {
+                                            kind: SpotifyCollectionKind::PublicUrl { url },
+                                            name,
+                                            ..
+                                        }) = app.spotify_cols.get(i).cloned()
+                                        {
+                                            app.spotify.saved_links.retain(|l| l.url != url);
+                                            let _ = save_spotify_session(&app.spotify);
+                                            app.spotify_cols.remove(i);
+                                            if app.spotify_cols.is_empty() {
+                                                app.spotify_col_state.select(None);
+                                            } else {
+                                                app.spotify_col_state.select(Some(i.min(app.spotify_cols.len() - 1)));
+                                            }
+                                            app.status = format!("Unlinked Spotify playlist '{name}'");
+                                        }
                                     }
                                 } else if let View::Playlist(idx) = app.view {
                                     if let Some(sel) = app.track_state.selected() {
@@ -2585,19 +3540,7 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
                                     app.status = format!("Deleted '{t}' from cache");
                                 }
                             }
-                            KeyCode::Char('c') => {
-                                let (n, freed) = prune_lru(&app.dir, &mut app.lib, app.max_bytes);
-                                app.rebuild_track_list();
-                                app.status = if n > 0 {
-                                    format!("Pruned {n} tracks (freed {})", fmt_mb(freed))
-                                } else {
-                                    format!(
-                                        "Cache under {} ({})",
-                                        fmt_mb(app.max_bytes),
-                                        fmt_mb(total_cache_bytes(&app.lib))
-                                    )
-                                };
-                            }
+                            KeyCode::Char('c') => app.trigger_button(ButtonAction::PruneCache),
                             _ => {}
                         },
                     }
@@ -2618,26 +3561,23 @@ fn run_tui(max_mb: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn self_status_msg(app: &mut App, msg: String) {
-    app.status = msg;
-}
-
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let max_mb: u64 = env::var("ITMP_CACHE_MB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_MB);
-    let max_bytes = max_mb * 1_048_576;
+    let env_max_mb: Option<u64> = env::var("ITMP_CACHE_MB").ok().and_then(|v| v.parse().ok());
     let dir = audio_dir();
 
     if args.is_empty() {
-        if let Err(e) = run_tui(max_mb) {
+        if let Err(e) = run_tui(env_max_mb) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
         return;
     }
+
+    let max_mb = env_max_mb
+        .or_else(|| load_and_sync_library(&dir).max_cache_mb)
+        .unwrap_or(DEFAULT_MAX_MB);
+    let max_bytes = max_mb * 1_048_576;
 
     match args[0].as_str() {
         "import" => {
@@ -2647,11 +3587,44 @@ fn main() {
                 std::process::exit(1);
             }
             if expand_local_path(&raw).exists() {
-                match import_local_music(&dir, &raw, max_bytes) {
-                    Ok(m) => println!("{m}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
+                let p = expand_local_path(&raw);
+                if let Some(bundle) = parse_spotify_export_file(&p) {
+                    println!(
+                        "Importing '{}' ({} tracks)...",
+                        bundle.collection_name,
+                        bundle.tracks.len()
+                    );
+                    for (i, tr) in bundle.tracks.iter().enumerate() {
+                        print!(
+                            "[{}/{}] {} - {} ... ",
+                            i + 1,
+                            bundle.tracks.len(),
+                            tr.artist,
+                            tr.title
+                        );
+                        let q = format!("ytsearch1:{} {} audio", tr.artist, tr.title);
+                        match download_and_cache_track(
+                            &dir,
+                            &q,
+                            &tr.title,
+                            &tr.artist,
+                            &tr.album,
+                            None,
+                            tr.duration_sec,
+                            Some(&bundle.collection_name),
+                            max_bytes,
+                        ) {
+                            Ok((_, msg)) => println!("{msg}"),
+                            Err(e) => println!("FAIL ({e})"),
+                        }
+                    }
+                } else {
+                    match import_local_music(&dir, &raw, max_bytes) {
+                        Ok(m) => println!("{m}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             } else if raw.contains("open.spotify.com/") || raw.starts_with("spotify:") {
@@ -2787,11 +3760,12 @@ fn main() {
                 );
             }
             println!(
-                "Total: {} / {} ({} tracks, {} playlists)",
+                "Total: {} / {} ({} tracks, {} playlists, {} liked artists)",
                 fmt_mb(total_cache_bytes(&lib)),
                 fmt_mb(max_bytes),
                 entries.len(),
-                lib.playlists.len()
+                lib.playlists.len(),
+                lib.liked_artists.len()
             );
         }
         "spotify" => match args.get(1).map(|s| s.as_str()) {
@@ -2820,7 +3794,7 @@ fn main() {
                 if sess.is_logged_in() {
                     println!("Spotify: logged in as '{}'", sess.display_name);
                 } else {
-                    println!("Spotify: not logged in (run `itmp spotify login <client-id>` or open Spotify inside TUI)");
+                    println!("Spotify: not logged in (open Settings -> Link Spotify URL/CSV or run `itmp spotify login <client-id>`)");
                 }
             }
             _ => {

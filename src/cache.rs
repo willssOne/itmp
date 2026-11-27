@@ -35,12 +35,25 @@ pub struct Playlist {
     pub tracks: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LikedArtist {
+    pub name: String,
+    #[serde(default)]
+    pub spotify_id: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Library {
     #[serde(default)]
     pub entries: HashMap<String, TrackEntry>,
     #[serde(default)]
     pub playlists: Vec<Playlist>,
+    #[serde(default)]
+    pub liked_artists: Vec<LikedArtist>,
+    #[serde(default)]
+    pub max_cache_mb: Option<u64>,
 }
 
 pub fn home_dir() -> PathBuf {
@@ -268,6 +281,47 @@ pub fn add_track_to_playlist(lib: &mut Library, playlist_name: &str, filename: &
             tracks: vec![filename.to_string()],
         });
     }
+}
+
+pub fn clean_artist_name(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    for suffix in [" - Topic", " – Topic", "VEVO", " Official"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim().to_string();
+        }
+    }
+    s
+}
+
+fn norm_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| match c {
+            'ë' | 'Ë' => 'e',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+pub fn find_cached_track(lib: &Library, title: &str, artist: &str) -> Option<String> {
+    let nt = norm_match(title);
+    if nt.len() < 2 {
+        return None;
+    }
+    let na = norm_match(&clean_artist_name(artist));
+    for (fname, e) in &lib.entries {
+        let et = norm_match(&e.title);
+        if et == nt || (et.len() >= 4 && nt.len() >= 4 && (et.contains(&nt) || nt.contains(&et))) {
+            if na.is_empty() || e.artist.is_empty() {
+                return Some(fname.clone());
+            }
+            let ea = norm_match(&clean_artist_name(&e.artist));
+            if ea.contains(&na) || na.contains(&ea) || et == nt {
+                return Some(fname.clone());
+            }
+        }
+    }
+    None
 }
 
 pub fn fmt_mb(bytes: u64) -> String {
