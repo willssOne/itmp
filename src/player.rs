@@ -3,12 +3,19 @@ use serde_json::{json, Value};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::Duration,
 };
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+    fn getppid() -> i32;
+    fn _exit(status: i32) -> !;
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct PlaybackState {
@@ -45,21 +52,39 @@ impl MpvPlayer {
             }
         }
         let _ = fs::remove_file(&self.sock_path);
-        let child = Command::new("mpv")
-            .args([
-                "--no-video",
-                "--no-terminal",
-                "--really-quiet",
-                "--audio-display=no",
-                "--idle=yes",
-                "--ao=pipewire",
-                "--audio-channels=stereo",
-                &format!("--volume={}", self.volume),
-                &format!("--input-ipc-server={}", self.sock_path.display()),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let parent_pid = std::process::id() as i32;
+        let mut cmd = Command::new("mpv");
+        cmd.args([
+            "--no-video",
+            "--no-terminal",
+            "--really-quiet",
+            "--audio-display=no",
+            "--idle=yes",
+            "--ao=pipewire",
+            "--audio-channels=stereo",
+            &format!("--volume={}", self.volume),
+            &format!("--input-ipc-server={}", self.sock_path.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+        // Guarantee mpv dies IMMEDIATELY if itmp exits for ANY reason
+        // (q, Ctrl+C, closing terminal window / SIGHUP, SIGTERM, SIGKILL, crash).
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(move || {
+                const PR_SET_PDEATHSIG: i32 = 1;
+                const SIGKILL: usize = 9;
+                prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+                if getppid() != parent_pid {
+                    _exit(1);
+                }
+                Ok(())
+            });
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| format!("failed to launch mpv: {e}"))?;
         self.child = Some(child);
