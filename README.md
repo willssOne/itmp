@@ -29,7 +29,7 @@ A lightweight, fast, low-memory Spotify-style terminal music player written in R
 ## Install
 
 ```bash
-git clone https://github.com/wguijweguiuhwf/itmp.git
+git clone https://github.com/willssOne/itmp.git
 cd itmp
 cargo build --release
 install -Dm755 target/release/itmp ~/.local/bin/itmp

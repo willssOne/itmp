@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "In-Terminal Music Player — lightweight Rust TUI music player with word-by-word synced lyrics, album art, Spotify import & 500 MB LRU cache"
 license = "MIT"
-repository = "https://github.com/wguijweguiuhwf/itmp"
+repository = "https://github.com/willssOne/itmp"
 
 [dependencies]
 crossterm = "0.28"
